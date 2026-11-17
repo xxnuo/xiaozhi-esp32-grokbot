@@ -237,38 +237,84 @@ void RareCooldowns() {
     }
     CHECK(seen[0] && seen[1] && seen[2]);
 }
+void ListeningEcho() {
+    Director d;
+    Boot(d);
+    d.SetNow(1000);
+    d.OnStatus(Status::kLoading);
+    CHECK(Is(d.Step(1000), "loading"));
+    d.SetNow(1200);
+    d.OnStatus(Status::kListening);
+    const auto listening = d.Step(1200);
+    CHECK(Is(listening, "listening"));
+    for (int64_t t : {1200, 1400, 2699}) {
+        d.SetNow(t);
+        d.OnStatus(Status::kListening);  // Same-status refreshes must not extend the window.
+        d.OnUserSpeech();
+        CHECK(d.Step(t).seq == listening.seq);
+    }
+    d.SetNow(2700);
+    d.OnUserSpeech();
+    CHECK(Is(d.Step(2700), "thinking"));
+    d.OnStatus(Status::kStreaming);
+    d.Step(2700);
+    d.SetNow(4000);
+    d.OnStatus(Status::kListening);
+    d.Step(4000);
+    d.SetNow(5499);
+    d.OnUserSpeech();
+    CHECK(Is(d.Step(5499), "listening"));
+    d.SetNow(5500);
+    d.OnUserSpeech();
+    CHECK(Is(d.Step(5500), "thinking"));
+
+    Director greeting;
+    Boot(greeting);
+    greeting.OnStatus(Status::kListening);
+    greeting.Step(0);
+    greeting.SetNow(200);
+    greeting.OnStatus(Status::kStreaming);
+    const bool accepted = greeting.OnEmotion("happy");
+    CHECK(accepted);
+    const auto emotion = greeting.Step(200);
+    greeting.SetNow(300);
+    greeting.OnUserSpeech();  // A late echo must also preserve the greeting emotion.
+    CHECK(greeting.Step(300).seq == emotion.seq);
+}
 void Thinking() {
+    ListeningEcho();
     Director d;
     Boot(d);
     d.OnStatus(Status::kListening);
     auto s0 = d.Step(0);
     CHECK(Is(s0, "listening"));
+    d.SetNow(1500);
     d.OnUserSpeech();
-    auto s1 = d.Step(0);
+    auto s1 = d.Step(1500);
     CHECK(Is(s1, "thinking") && s1.max_frames == 31 && s1.from_frame_zero &&
           s1.mode == Mode::kOncePingPong);
     d.OnClipEvent(Event::kCycleBoundary);
-    CHECK(Is(d.Step(1999), "thinking"));
-    CHECK(Is(d.Step(2000), "thinking"));  // A deadline alone cannot cut an active clip.
+    CHECK(Is(d.Step(3499), "thinking"));
+    CHECK(Is(d.Step(3500), "thinking"));  // A deadline alone cannot cut an active clip.
     d.OnClipEvent(Event::kOnceDone);
-    auto s2 = d.Step(2033);
+    auto s2 = d.Step(3533);
     CHECK(Is(s2, "working") && s2.max_frames == 31 && s2.from_frame_zero &&
           s2.mode == Mode::kOncePingPong);
-    CHECK(Is(d.Step(4000), "working"));
+    CHECK(Is(d.Step(5500), "working"));
     d.OnClipEvent(Event::kOnceDone);
-    auto s3 = d.Step(4066);
+    auto s3 = d.Step(5566);
     CHECK(Is(s3, "searching") && s3.max_frames == 0 && s3.from_frame_zero);
     for (const char* name : {"writing", "working", "searching"}) {
         d.OnClipEvent(Event::kOnceDone);
-        auto cur = d.Step(6600);
+        auto cur = d.Step(8100);
         CHECK(Is(cur, name));
     }
     bool ok = d.OnEmotion("happy");
     CHECK(ok);
-    auto s4 = d.Step(6600);
+    auto s4 = d.Step(8100);
     CHECK(Is(s4, "searching"));
     d.OnStatus(Status::kStreaming);
-    auto s5 = d.Step(6600);
+    auto s5 = d.Step(8100);
     CHECK(!Is(s5, "searching"));
 }
 void Emotions() {
@@ -459,7 +505,60 @@ void Transitions() {
     auto hap = d.Step(4000);
     CHECK(Is(hap, "happy") && hap.mode == Mode::kLoopPingPong);
 }
+void WakeInterruption() {
+    for (int response : {0, 1, 2}) {
+        const bool greeting = response == 1;
+        Director d;
+        Boot(d);
+        d.OnPowerSave(true);
+        d.Step(0);
+        d.OnClipEvent(Event::kOnceDone);
+        d.Step(0);
+        d.SetNow(10000);
+        d.OnStatus(Status::kLoading);
+        const auto wake = d.Step(10000);
+        CHECK(Is(wake, "waking"));
+        d.SetNow(10300);
+        d.OnStatus(Status::kListening);
+        d.OnUserSpeech();  // Wake-word echo must not request thinking.
+        CHECK(d.Step(10300).seq == wake.seq);
+        d.SetNow(11799);
+        d.OnUserSpeech();
+        CHECK(d.Step(11799).seq == wake.seq);
+        if (greeting) {
+            d.OnStatus(Status::kStreaming);
+            const bool accepted = d.OnEmotion("happy");
+            CHECK(accepted);
+        }
+        CHECK(d.Step(11800).seq == wake.seq);
+        if (response == 2) {
+            d.OnUserSpeech();  // At 1.5s a real transcript is retained for after waking.
+            CHECK(d.Step(11800).seq == wake.seq);
+        }
+        d.SetNow(12367);
+        d.OnClipEvent(Event::kOnceDone);
+        const auto after = d.Step(12367);
+        if (greeting)
+            CHECK(!Is(after, "waking") && !Is(after, "streaming") && !Is(after, "thinking"));
+        else
+            CHECK(Is(after, response == 2 ? "thinking" : "listening"));
+    }
+    for (Status interrupt : {Status::kFailed, Status::kReceiving, Status::kRadar}) {
+        Director d;
+        Boot(d);
+        d.OnPowerSave(true);
+        d.Step(0);
+        d.OnPowerSave(false);
+        CHECK(Is(d.Step(0), "waking"));
+        d.OnStatus(interrupt);
+        const auto after = d.Step(0);
+        CHECK(Is(after, interrupt == Status::kFailed      ? "confused"
+                        : interrupt == Status::kReceiving ? "receiving"
+                                                          : "radar"));
+    }
+}
 void Wake() {
+    WakeInterruption();
     Director d;
     Boot(d);
     d.Step(220000);
@@ -468,7 +567,9 @@ void Wake() {
     CHECK(Is(wake, "waking") && wake.max_frames == 73);
     d.OnUserSpeech();
     auto th = d.Step(220000);
-    CHECK(Is(th, "thinking"));
+    CHECK(Is(th, "waking") && th.seq == wake.seq);
+    d.OnClipEvent(Event::kOnceDone);
+    CHECK(Is(d.Step(220000), "listening"));
     d.OnStatus(Status::kIdle);
     d.Step(220000);
     d.OnPowerSave(true);
@@ -558,6 +659,9 @@ void Legacy() {
     }
     d.OnUserSpeech();
     d.OnStatus(Status::kListening);
+    CHECK(Is(d.Step(299000), "waking"));
+    d.OnClipEvent(Event::kOnceDone);
+    CHECK(Is(d.Step(301500), "listening"));
     d.OnUserSpeech();
     auto th = d.Step(302000);
     CHECK(Is(th, "thinking"));

@@ -143,6 +143,8 @@ GrokBotDirector::Directive GrokBotDirector::Select(const char* clip, PlayMode mo
     return current_;
 }
 void GrokBotDirector::StartTransition(const char* clip, uint16_t max_frames) {
+    if (Equal(clip, "waking") && Available(clip) && !Equal(transition_, "waking"))
+        wake_echo_until_ = now_ + 1500;
     transition_ = Available(clip) ? clip : nullptr;
     transition_max_ = max_frames;
     cycle_ = false;
@@ -182,8 +184,10 @@ void GrokBotDirector::OnStatus(StatusId status) {
         emotion_group_ = -1;
     }
     speech_since_ = -1;
-    if (status == StatusId::kListening)
+    if (status == StatusId::kListening) {
         listening_since_ = now_;
+        wake_echo_until_ = now_ + 1500;
+    }
     if (status == StatusId::kStreaming) {
         session_spoke_ = true;
         power_save_ = false;
@@ -191,6 +195,13 @@ void GrokBotDirector::OnStatus(StatusId status) {
         sleeping_ = false;
     } else if (status == StatusId::kIdle || status == StatusId::kFailed) {
         session_spoke_ = false;
+    }
+    if (keep_waking && (status == StatusId::kIdle || status == StatusId::kListening ||
+                        status == StatusId::kStreaming || status == StatusId::kLoading)) {
+        transition_ = "waking";
+        if (status == StatusId::kIdle)
+            ResetIdle(!first_idle);
+        return;
     }
     if (status == StatusId::kIdle) {
         ResetIdle(!first_idle);
@@ -257,7 +268,11 @@ bool GrokBotDirector::OnEmotion(const char* emotion) {
     return false;
 }
 void GrokBotDirector::OnUserSpeech() {
-    transition_ = nullptr;
+    // The wake-word transcript is echoed as a user message before the greeting.
+    if (now_ < wake_echo_until_)
+        return;
+    if (!Equal(transition_, "waking"))
+        transition_ = nullptr;
     fidget_ = nullptr;
     emotion_ = nullptr;
     emotion_group_ = -1;
@@ -392,8 +407,7 @@ GrokBotDirector::Directive GrokBotDirector::Step(int64_t now_ms) {
     }
     const bool wake_transition = Equal(transition_, "waking");
     const bool failure_transition = status_ == StatusId::kFailed && Equal(transition_, "confused");
-    if (failure_transition ||
-        (wake_transition && (status_ == StatusId::kListening || status_ == StatusId::kLoading)))
+    if (failure_transition || wake_transition)
         return Select(transition_, OnceMode(transition_), transition_max_, Layer::kTransition);
     const char* business = nullptr;
     switch (status_) {

@@ -74,7 +74,13 @@ Additional clips and mappings in the 39-clip subset:
   Minute clock status updates (`HH:MM`) do not reset the idle timer.
 - **Transitions**: Boot starts with `logo`; power-save plays a `drowsy` round trip
   before `sleeping`, with the whole transition at 30 FPS before the 5 FPS sleep loop.
-  Waking plays `waking[2..72]`, ending near the idle face. User speech during listening
+  Waking plays `waking[2..72]`, ending near the idle face. It completes across
+  connecting/listening/streaming changes and user transcripts, then follows the latest
+  status (including a queued speaking emotion or thought sequence); failure and strong
+  business states such as OTA can interrupt it. User messages during the first 1.5s
+  after entering listening (or starting waking) are treated as wake-word echoes for
+  animation and do not start thinking.
+  Recognition and server messages are unaffected. User speech during listening
   starts `thinking` -> `working` -> `searching`/`writing`/`working`: the first two
   round trips last ~2.03s each (frames 0–30–0), and every thought clip returns to
   its shared frame 0 before the next starts; non-neutral emotions during speaking override

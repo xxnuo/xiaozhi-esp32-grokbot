@@ -64,6 +64,14 @@ class GrokBotPreviewTests(unittest.TestCase):
         waking = [frame for frame in frames if 10000 <= frame[0] < 10200]
         self.assertEqual([index for _, clip, index in waking], list(range(2, 8)))
         self.assertTrue(all(clip == "waking" for _, clip, _ in waking))
+        first_wake = [frame for frame in frames if 10000 <= frame[0] < 12366]
+        self.assertEqual([index for _, _, index in first_wake], list(range(2, 73)))
+        self.assertTrue(all(clip == "waking" for _, clip, _ in first_wake))
+        after_wake = next(clip for ms, clip, _ in frames if ms == 12366)
+        self.assertNotIn(after_wake, ("waking", "thinking", "streaming"))
+        self.assertTrue(all(clip == "waking" for ms, clip, _ in frames if 21000 <= ms < 23366))
+        self.assertEqual(next(clip for ms, clip, _ in frames if ms == 23366), "thinking")
+
 
     def test_invalid_render_arguments_exit_before_creating_output(self):
         root = self.root

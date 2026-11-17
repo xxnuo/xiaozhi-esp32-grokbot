@@ -64,6 +64,7 @@ private:
     int64_t idle_since_ = -20000;
     int64_t listening_since_ = 0;
     int64_t speech_since_ = -1;
+    int64_t wake_echo_until_ = 0;
     int64_t next_fidget_ = 0;
     int64_t idle_pause_until_ = 0;
     int64_t notification_until_ = 0;

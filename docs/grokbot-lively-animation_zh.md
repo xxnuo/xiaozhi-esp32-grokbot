@@ -27,7 +27,7 @@
 - **素材**：atlas 28 -> 39 clip（5,281,647 B），新增 `humming suspicious finished celebrate working turntable logo spawning writing receiving powering-down`。
 - **导演** `main/display/grokbot_director.{h,cc}`：纯 C++、零 ESP 依赖，注入单调时钟和种子；输出 `{clip, mode, max_frames, seq, from_frame_zero}`；三种播放模式 `kLoopPingPong / kOnceForward / kOncePingPong`；闲时等循环边界、思考链往返回到共享第 0 帧后切换；按实际 atlas 过滤 clip，旧 28-clip 资产自动降级。
 - **闲时阶段**：0-20s 余韵（6-11s 一个动作）-> 20-120s 探索与彩蛋（10-18s，`turntable/celebrate/logo` 独立长冷却）-> 120-240s 打盹（8-15s）-> 240-300s `drowsy` 循环 -> 300s+ `sleeping`。这些是对话结束后的闲时年龄；开机预置 20s，故从探索起算，100s 起打盹、220s 起等边界进入 `drowsy`、280s 起等边界进入 `sleeping`。最近两个动作不重复。
-- **过渡**：开机 `logo[2..56]` 往返；睡眠唤醒 `waking[2..72]`（跨 Connecting->Listening 保留）；思考链 `thinking -> working -> searching/writing/working`，前两段各约 2.03s，以 `0..30..0` 往返在共享第 0 帧接合；说话中情绪 8s 并在边界柔切回 `streaming`；对话结束 `finished[2..29]`（0.93s）；失败 `confused -> failed`；省电 `drowsy` 往返接 `sleeping`（30fps 播完再降 5fps）；OTA `receiving`；Wi-Fi 扫描 `radar`。
+- **过渡**：开机 `logo[2..56]` 往返；睡眠唤醒 `waking[2..72]`（跨 Connecting->Listening->Streaming 及 user 回显保留，播完再按最新状态继续）；思考链 `thinking -> working -> searching/writing/working`，前两段各约 2.03s，以 `0..30..0` 往返在共享第 0 帧接合；说话中情绪 8s 并在边界柔切回 `streaming`；对话结束 `finished[2..29]`（0.93s）；失败 `confused -> failed`；省电 `drowsy` 往返接 `sleeping`（30fps 播完再降 5fps）；OTA `receiving`；Wi-Fi 扫描 `radar`。
 - **情绪多变体**：每种 LLM 情绪对应加权变体池，避开上一变体，2s 内同组合并；系统图标保持确定映射。
 - **显示层** `grokbot_display.{h,cc}`：portMUX mailbox 取代零散 atomic 指针；帧游标正/倒放 XOR、关键帧重建、失败重试判定抽成 `grokbot_player.h` 中可主机测试的纯函数。
 
@@ -44,10 +44,11 @@
 
 ## 验证状态
 
-- [x] 主机测试 `uv run python -m unittest discover -s scripts/tests`：169 项，1 跳过（缺 cJSON 开发头）。含导演测试与帧游标测试（`-UNDEBUG`，副作用不在断言内）。
-- [x] 固件：`espressif/idf:release-v6.1` 构建 `m5stack-stopwatch-grokbot` 成功，app `0x2dd600`，分区剩余 27%；assets 6,860,726 B < 8 MiB。
+- [x] 主机测试 `uv run python -m unittest discover -s scripts/tests`：171 项，1 跳过（缺 cJSON 开发头）。含导演测试与帧游标测试（`-UNDEBUG`，副作用不在断言内）。
+- [x] 固件：`espressif/idf:release-v6.1` 构建 `m5stack-stopwatch-grokbot` 成功，app `0x2ddcc0`，分区剩余 27%；assets 6,860,726 B < 8 MiB。
 - [x] 真机闲时（2026-11-17，M5Stack StopWatch，SKU `m5stack-stopwatch-grokbot`，烧录 app + assets，保留 NVS）：加载 39 个 clip；闲时 29.55-29.71fps，解码约 15-18ms/帧，TE 59-60Hz 无超时；内部 SRAM 最低 33,468 B，PSRAM 余约 4.0 MB；330s 内无崩溃。实测时间线：logo 开机 -> idle(10.8s) -> suspicious/curious/humming/shy 小动作间隔约 12-18s，含随机停顿 -> 120s 起 drowsy/humming/shy -> 232s drowsy 循环 -> 288s sleeping。旧固件基线为 28 clip、开机 21.35fps。
-- [ ] 真机对话：唤醒/思考链/说话情绪/finished 过渡、音频并发连续性、省电睡眠与唤醒。
+- [x] 真机对话（临时 debug 固件定时调用 `WakeWordInvoke("hi esp")`，服务端回问候；debug 代码未提交，验证后已刷回干净固件）：空闲唤醒 `loading -> listening -> streaming -> happy` 情绪随说话出现，回显不再闪 `thinking`；服务端结束会话后 `finished -> idle` 并恢复小动作；睡眠 412s 后唤醒完整播 `waking`（约 2.4s）再接 `excited`。各状态帧率：idle 29.57、listening 27.19（最低 25.73，音频并发）、happy 28.47、waking 27.41、finished 27.62fps；无崩溃，日志 `.tmp/hw/autowake*.log`。
+- [ ] 真机思考链：需真人说话产生 STT，主机测试与预览已覆盖；人耳评估说话音频连续性也待真人确认。
 
 提交：`ae616fb`（atlas）、`15cbf0c`（导演与显示层）。
 
@@ -61,10 +62,11 @@
 - `spawning[40..60]` 亮度约 1.98，`powering-down[12..]` 约 1.47 继续趋暗，而 `sleeping[2]` 为 66.99。帧数上限无法跳过开头，故开机换无黑屏的 `logo`、省电换 `drowsy` 往返，低电量情绪也只用 `drowsy`，避免熄灭后突然恢复亮脸。
 - `waking[67..72]` 与 idle 的 MAE 约 0.008，故播到 72；`finished[29..53]` 完全静止，`logo[57..119]` 的相邻帧差已小于 0.05（60 起归零），分别限 30、57 帧。探索期和打盹期的 `shy` 均限 90 帧。
 - 思考片段的第 0 帧完全相同；加入 `from_frame_zero`，通过 `kOnceDone` 在往返结束后推进，避免图标中段突然切成明亮人脸。
+- 真机自动唤醒日志 `.tmp/hw/autowake.log` 的 431–438s 显示，`>> hi esp` 回显先触发思考、服务端问候随即切入 speaking，原本 2.37s 的 `waking` 约 0.3s 就被打断。现将 waking 置于 listening/streaming 和 user 消息之前，播完才按最新状态接 speaking 情绪或思考链；失败、OTA 等强业务状态仍可抢占。进入 listening 或开始 waking 后 1.5s 内的 user 消息仅按唤醒词回显处理，不启动思考动画，不改变识别与服务端消息。
 
-种子 42 的新时间表：开机闲时等待依次为 14.27 / 12.27 / 17.73 / 17.73 / 19.40s，后续打盹期常见 11.83s，间有 17.73s；呼吸接缝保留部分 5.9s 倍数，随机静止段打散其余等待。开机 221.57s 进入 `drowsy`，280.10s 进入 `sleeping`。对话场景仍在 5.50 / 7.53 / 9.57s 进入 `thinking` / `working` / `searching`，24.00–24.93s 播 `finished`，随后余韵首次等待 11.83s（包含等待呼吸接缝），36.77s 开始 `humming`。省电场景 3.50–6.13s 播 `drowsy`、6.13s 接 `sleeping`；10.00–12.37s 完整唤醒，开机/省电路径不含长黑屏素材。
+种子 42 的新时间表：开机闲时等待依次为 14.27 / 12.27 / 17.73 / 17.73 / 19.40s，后续打盹期常见 11.83s，间有 17.73s；呼吸接缝保留部分 5.9s 倍数，随机静止段打散其余等待。开机 221.57s 进入 `drowsy`，280.10s 进入 `sleeping`。对话场景仍在 5.50 / 7.53 / 9.57s 进入 `thinking` / `working` / `searching`，24.00–24.93s 播 `finished`，随后余韵首次等待 11.83s（包含等待呼吸接缝），36.77s 开始 `humming`。省电场景 3.50–6.13s 播 `drowsy`、6.13s 接 `sleeping`；10.00–12.37s 完整唤醒，10.30s 回显、10.35s streaming、10.40s happy 情绪均不截断；21.00–23.37s 再次完整唤醒，21.30s 回显被忽略，22.90s 的真实 user 消息在 23.37s 开始思考链。开机/省电路径不含长黑屏素材。
 
-预览 `_stats.json` 同时统计相对 `idle[2]` 的非静止帧与相邻帧运动占比，阈值均为 MAE >0.01/255，仅统计 `idle` 基础画面。种子 42 三场景的相邻运动帧分别为 **86.15% / 88.70% / 87.00%**；相对静脸的非静止帧为 86.50% / 89.06% / 87.13%。20 个种子的开机预览，相邻运动帧占 **84.70%–88.70%**；完整小动作间的冷却最小 / P25 / 中位数 / P75 / P95 / 最大为 **11.833 / 11.833 / 13.467 / 17.733 / 19.400 / 20.600s**（排除开机初段和进入长困倦的截断段），统计保存在 `.tmp/preview/idle_distribution.json`。这些是实际播放等待；配置冷却仍是余韵 6–11s、探索 10–18s、打盹 8–15s，额外等待来自上述接缝。
+预览 `_stats.json` 同时统计相对 `idle[2]` 的非静止帧与相邻帧运动占比，阈值均为 MAE >0.01/255，仅统计 `idle` 基础画面。种子 42 三场景的相邻运动帧分别为 **86.15% / 88.70% / 60.61%**；相对静脸的非静止帧为 86.50% / 89.06% / 57.14%。睡醒场景现用于回显/问候/真实用户消息回归，只有 35 帧基础 idle，不用于评估长期呼吸占比。20 个种子的开机预览，相邻运动帧占 **84.70%–88.70%**；完整小动作间的冷却最小 / P25 / 中位数 / P75 / P95 / 最大为 **11.833 / 11.833 / 13.467 / 17.733 / 19.400 / 20.600s**（排除开机初段和进入长困倦的截断段），统计保存在 `.tmp/preview/idle_distribution.json`。这些是实际播放等待；配置冷却仍是余韵 6–11s、探索 10–18s、打盹 8–15s，额外等待来自上述接缝。
 
 
 ## 后续想法（未实施）

@@ -247,14 +247,21 @@ int main(int argc, char** argv) {
         actions.push_back({24000, Action::Type::kStatus, Status::kIdle});
         duration_ms = 64000;
     } else if (scenario == "wake_from_sleep") {
-        // Enter sleep via power-save, wake to idle; then enter deep sleep and wake into listening.
+        // Sleep -> wake/listen/echo/greeting; then sleep -> wake/echo/real user transcript.
         actions.push_back({0, Action::Type::kStatus, Status::kIdle});
         actions.push_back({3500, Action::Type::kPowerSave, Status::kIdle, nullptr, true});
         actions.push_back({10000, Action::Type::kPowerSave, Status::kIdle, nullptr, false});
+        actions.push_back({10300, Action::Type::kStatus, Status::kListening});
+        actions.push_back({10300, Action::Type::kUserSpeech});
+        actions.push_back({10350, Action::Type::kStatus, Status::kStreaming});
+        actions.push_back({10400, Action::Type::kEmotion, Status::kIdle, "happy"});
+        actions.push_back({14000, Action::Type::kStatus, Status::kIdle});
         actions.push_back({15000, Action::Type::kPowerSave, Status::kIdle, nullptr, true});
         actions.push_back({21000, Action::Type::kStatus, Status::kLoading});
-        actions.push_back({21600, Action::Type::kStatus, Status::kListening});
-        actions.push_back({25000, Action::Type::kStatus, Status::kIdle});
+        actions.push_back({21300, Action::Type::kStatus, Status::kListening});
+        actions.push_back({21300, Action::Type::kUserSpeech});
+        actions.push_back({22900, Action::Type::kUserSpeech});
+        actions.push_back({28000, Action::Type::kStatus, Status::kIdle});
         duration_ms = 30000;
     } else {
         std::fprintf(stderr, "Unknown scenario: %s\n", scenario.c_str());
