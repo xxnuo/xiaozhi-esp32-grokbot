@@ -134,6 +134,8 @@ public:
                                  next.clip ? next.clip : "(null)");
                     std::exit(1);
                 }
+                if (has_selected_)
+                    fade_step_ = 0;
                 current_clip_ = cm;
                 directive_ = next;
                 const int upper = GrokBotFrameUpper(current_clip_->frames, directive_.max_frames);
@@ -145,11 +147,15 @@ public:
                 held_frames_ = 0;
             }
 
-            std::printf("%lld %s %d\n", static_cast<long long>(now_ms), directive_.clip,
-                        current_index_);
+            std::printf("%lld %s %d %u\n", static_cast<long long>(now_ms), directive_.clip,
+                        current_index_, directive_.seq);
 
-            const int repeats =
-                power_save_ && std::strcmp(directive_.clip, "sleeping") == 0 ? 6 : 1;
+            const int repeats = power_save_ && std::strcmp(directive_.clip, "sleeping") == 0 &&
+                                        fade_step_ >= kGrokBotFadeFrames
+                                    ? 6
+                                    : 1;
+            if (fade_step_ < kGrokBotFadeFrames)
+                ++fade_step_;
             if (once_done_ || ++held_frames_ < repeats) {
                 continue;
             }
@@ -187,6 +193,7 @@ private:
     bool once_done_ = false;
     bool power_save_ = false;
     int held_frames_ = 0;
+    unsigned fade_step_ = kGrokBotFadeFrames;
 };
 
 }  // namespace

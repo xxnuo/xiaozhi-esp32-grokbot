@@ -32,7 +32,9 @@ public:
 private:
     static void RounderEventCb(lv_event_t* event);
     static void AnimationTaskEntry(void* arg);
+    static void RefreshTaskEntry(void* arg);
     static void TeIsr(void* arg);
+    static void RefreshEventCb(lv_event_t* event);
     void AnimationTask();
     void InitializeTe();
     bool WaitForTeFrame(int fps);
@@ -40,6 +42,7 @@ private:
     bool EnsurePlayer();
     bool DecodeFrame(const GrokBotPlayer::FrameInfo& frame, bool expand);
     bool RebuildCurrentFrame();
+    bool CacheStartFrames();
     void ExpandPackedFrame();
     bool PresentFrame();
     int64_t NowUs() const;
@@ -55,6 +58,7 @@ private:
     bool player_ready_ = false;
     int64_t next_atlas_check_us_ = 0;
 
+    uint8_t* start_frames_ = nullptr;
     uint8_t* packed_ = nullptr;
     uint8_t* delta_ = nullptr;
     tinfl_decompressor* decompressor_ = nullptr;
@@ -65,7 +69,25 @@ private:
     int frame_height_ = 0;
     size_t packed_size_ = 0;
     size_t image_size_ = 0;
-    int write_buffer_ = 0;
+    GrokBotFramePipeline pipeline_;
+    SemaphoreHandle_t refresh_ready_ = nullptr;
+    std::atomic<bool> refresh_pending_{false};
+    bool refreshing_frame_ = false;
+    bool awaiting_te_ = false;
+    int refresh_fps_ = 30;
+    std::atomic<uint32_t> te_timestamp_{0};
+    uint16_t* retired_image_ = nullptr;
+    lv_image_dsc_t retired_desc_ = {};
+    uint8_t* displayed_packed_ = nullptr;
+    uint8_t* fade_from_ = nullptr;
+    uint8_t* blend_lut_ = nullptr;
+    unsigned fade_step_ = kGrokBotFadeFrames;
+    bool have_displayed_frame_ = false;
+    std::atomic<int64_t> last_present_us_{0};
+    uint32_t frame_intervals_[256] = {};
+    unsigned interval_count_ = 0;
+    unsigned slow_frames_ = 0;
+    uint32_t te_lag_max_us_ = 0;
 
     bool reverse_ = false;
     bool has_selected_ = false;
@@ -84,4 +106,5 @@ private:
     int64_t decode_us_total_ = 0;
     int64_t present_us_total_ = 0;
     TaskHandle_t task_handle_ = nullptr;
+    TaskHandle_t refresh_task_ = nullptr;
 };

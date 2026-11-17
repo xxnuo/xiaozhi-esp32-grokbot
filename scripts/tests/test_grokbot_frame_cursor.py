@@ -37,6 +37,21 @@ class GrokBotFrameCursorTests(unittest.TestCase):
     def test_max_frames_limit(self):
         self.run_case("limit")
 
+    def test_six_frame_gray_blend(self):
+        self.run_case("blend")
+
+    def test_double_buffer_and_te_phase(self):
+        self.run_case("pipeline")
+
+    def test_failed_presentation_switch_and_pause(self):
+        self.run_case("failed-switch")
+
+    def test_fused_xor_expand_with_tail(self):
+        self.run_case("fused")
+
+    def test_cached_start_switch_preserves_cursor_semantics(self):
+        self.run_case("cached-switch")
+
     def test_presentation_failure_retry(self):
         self.run_case("retry")
 

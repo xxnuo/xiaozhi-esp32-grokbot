@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -45,6 +46,71 @@ inline GrokBotFrameStep GrokBotNextFrame(int target, bool reverse, int lower, in
     }
     return {target + (reverse ? -1 : 1), reverse};
 }
+
+inline uint8_t GrokBotDisplayGray(uint8_t coverage) {
+    return static_cast<uint8_t>(std::lround(255 * std::pow(coverage / 15.0, 1.0 / 2.2)));
+}
+
+constexpr unsigned kGrokBotFadeFrames = 6;
+
+inline uint8_t GrokBotBlendGray(uint8_t from, uint8_t to, unsigned step) {
+    if (step >= kGrokBotFadeFrames)
+        return to;
+    return (from * (kGrokBotFadeFrames - step) + to * step + kGrokBotFadeFrames / 2) /
+           kGrokBotFadeFrames;
+}
+
+inline uint8_t GrokBotBlendPacked(uint8_t from, uint8_t to, const uint8_t* lut) {
+    return (lut[(from & 0xf0) | (to >> 4)] << 4) | lut[((from & 15) << 4) | (to & 15)];
+}
+
+// Keep the original TE phase even after a missed deadline or counter wrap.
+inline uint32_t GrokBotNextTeEdge(uint32_t previous, uint32_t current, uint32_t stride) {
+    const uint32_t elapsed = current - previous;
+    return previous + (elapsed / stride + 1) * stride;
+}
+
+inline void GrokBotExpandDelta(uint8_t* packed, uint8_t* delta, uint32_t* pixels, size_t size,
+                               const uint32_t* lut, bool xor_delta) {
+    auto* words = reinterpret_cast<uint32_t*>(packed);
+    auto* deltas = reinterpret_cast<uint32_t*>(delta);
+    const size_t count = size / sizeof(uint32_t);
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t value = xor_delta ? words[i] ^ deltas[i] : deltas[i];
+        words[i] = value;
+        deltas[i] = value;
+        pixels[4 * i] = lut[value & 255];
+        pixels[4 * i + 1] = lut[(value >> 8) & 255];
+        pixels[4 * i + 2] = lut[(value >> 16) & 255];
+        pixels[4 * i + 3] = lut[value >> 24];
+    }
+    for (size_t i = count * sizeof(uint32_t); i < size; ++i) {
+        packed[i] = xor_delta ? packed[i] ^ delta[i] : delta[i];
+        delta[i] = packed[i];
+        pixels[i] = lut[packed[i]];
+    }
+}
+
+inline const uint8_t* GrokBotCachedStart(const uint8_t* cache, int selected, int target,
+                                         int start_frame, size_t frame_size) {
+    return cache && selected >= 0 && target == start_frame ? cache + selected * frame_size
+                                                           : nullptr;
+}
+
+struct GrokBotFramePipeline {
+    int write = 0;
+    bool pending = false;
+
+    int Submit() {
+        if (pending)
+            return -1;
+        const int submitted = write;
+        write ^= 1;
+        pending = true;
+        return submitted;
+    }
+    void Complete() { pending = false; }
+};
 
 class GrokBotPlayer {
 public:

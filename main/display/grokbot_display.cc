@@ -9,7 +9,9 @@
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_lvgl_port.h>
 #include <esp_timer.h>
+#include <freertos/idf_additions.h>
 #include <miniz.h>
 
 namespace {
@@ -93,6 +95,22 @@ GrokbotDisplay::GrokbotDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
 
 GrokbotDisplay::~GrokbotDisplay() {
     running_.store(false);
+    {
+        DisplayLockGuard lock(this);
+        if (lock && display_) {
+            lv_display_remove_event_cb_with_user_data(display_, RefreshEventCb, this);
+            if (emoji_image_)
+                lv_image_set_src(emoji_image_, nullptr);
+        }
+        if (task_handle_ != nullptr) {
+            vTaskDelete(task_handle_);
+            task_handle_ = nullptr;
+        }
+        if (refresh_task_) {
+            vTaskDeleteWithCaps(refresh_task_);
+            refresh_task_ = nullptr;
+        }
+    }
     if (te_isr_installed_) {
         gpio_isr_handler_remove(te_pin_);
         te_isr_installed_ = false;
@@ -101,14 +119,16 @@ GrokbotDisplay::~GrokbotDisplay() {
         vSemaphoreDelete(te_semaphore_);
         te_semaphore_ = nullptr;
     }
-    if (task_handle_ != nullptr) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        vTaskDelete(task_handle_);
-        task_handle_ = nullptr;
-    }
+    heap_caps_free(start_frames_);
+    heap_caps_free(retired_image_);
+    heap_caps_free(displayed_packed_);
+    heap_caps_free(fade_from_);
+    heap_caps_free(blend_lut_);
     heap_caps_free(packed_);
     heap_caps_free(delta_);
     heap_caps_free(decompressor_);
+    if (refresh_ready_)
+        vSemaphoreDelete(refresh_ready_);
     for (auto*& buffer : image_buffers_) {
         heap_caps_free(buffer);
         buffer = nullptr;
@@ -165,6 +185,7 @@ void GrokbotDisplay::TeIsr(void* arg) {
     if (display->te_semaphore_ == nullptr) {
         return;
     }
+    display->te_timestamp_.store(esp_timer_get_time(), std::memory_order_relaxed);
     display->te_edge_count_.fetch_add(1, std::memory_order_relaxed);
     BaseType_t higher_priority_task_woken = pdFALSE;
     xSemaphoreGiveFromISR(display->te_semaphore_, &higher_priority_task_woken);
@@ -182,10 +203,11 @@ bool GrokbotDisplay::WaitForTeFrame(int fps) {
     uint32_t edges_per_frame =
         (kPanelTeHz + static_cast<uint32_t>(fps) / 2) / static_cast<uint32_t>(fps);
     edges_per_frame = std::max<uint32_t>(1, edges_per_frame);
-    const uint32_t target_edge = last_te_present_count_ + edges_per_frame;
-    uint32_t current_edge = te_edge_count_.load(std::memory_order_acquire);
-
-    while (current_edge < target_edge) {
+    const uint32_t current = te_edge_count_.load(std::memory_order_acquire);
+    const uint32_t target_edge =
+        GrokBotNextTeEdge(last_te_present_count_, current, edges_per_frame);
+    uint32_t current_edge = current;
+    while (static_cast<int32_t>(current_edge - target_edge) < 0) {
         if (xSemaphoreTake(te_semaphore_, pdMS_TO_TICKS(25)) != pdTRUE) {
             te_timeout_count_.fetch_add(1, std::memory_order_relaxed);
             te_wait_us_total_.fetch_add(NowUs() - start_us, std::memory_order_relaxed);
@@ -194,11 +216,42 @@ bool GrokbotDisplay::WaitForTeFrame(int fps) {
         }
         current_edge = te_edge_count_.load(std::memory_order_acquire);
     }
-
-    last_te_present_count_ = current_edge;
+    last_te_present_count_ = target_edge;
     te_wait_us_total_.fetch_add(NowUs() - start_us, std::memory_order_relaxed);
     te_wait_count_.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void GrokbotDisplay::RefreshEventCb(lv_event_t* event) {
+    auto* self = static_cast<GrokbotDisplay*>(lv_event_get_user_data(event));
+    if (lv_event_get_code(event) == LV_EVENT_REFR_START) {
+        self->refreshing_frame_ = self->refresh_pending_.exchange(false);
+        self->awaiting_te_ = self->refreshing_frame_;
+    } else if (lv_event_get_code(event) == LV_EVENT_FLUSH_START) {
+        if (self->awaiting_te_) {
+            self->awaiting_te_ = false;
+            // Align the first DMA strip, not the asynchronous LVGL invalidation.
+            if (self->refresh_fps_ >= kNormalFps)
+                self->WaitForTeFrame(self->refresh_fps_);
+            const int64_t now = self->NowUs();
+            const int64_t previous = self->last_present_us_.exchange(now);
+            if (previous) {
+                portENTER_CRITICAL(&self->mailbox_mux_);
+                const uint32_t interval = now - previous;
+                self->te_lag_max_us_ =
+                    std::max(self->te_lag_max_us_,
+                             uint32_t(now) - self->te_timestamp_.load(std::memory_order_relaxed));
+                if (self->interval_count_ < 256)
+                    self->frame_intervals_[self->interval_count_++] = interval;
+                if (interval > 40000)
+                    ++self->slow_frames_;
+                portEXIT_CRITICAL(&self->mailbox_mux_);
+            }
+        }
+    } else if (self->refreshing_frame_) {
+        self->refreshing_frame_ = false;
+        xSemaphoreGive(self->refresh_ready_);
+    }
 }
 
 void GrokbotDisplay::SetupUI() {
@@ -241,8 +294,24 @@ void GrokbotDisplay::SetupUI() {
 
     lv_display_add_event_cb(display_, RounderEventCb, LV_EVENT_INVALIDATE_AREA, nullptr);
     InitializeTe();
+    refresh_ready_ = xSemaphoreCreateBinary();
+    if (!refresh_ready_) {
+        ESP_LOGE(TAG, "Failed to create refresh semaphore");
+        return;
+    }
+    xSemaphoreGive(refresh_ready_);
+    lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_REFR_START, this);
+    lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_REFR_READY, this);
+    lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_FLUSH_START, this);
 
     if (!running_.exchange(true)) {
+        if (xTaskCreatePinnedToCoreWithCaps(RefreshTaskEntry, "grokbot_refresh", 8 * 1024, this, 5,
+                                            &refresh_task_, 1,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            running_.store(false);
+            ESP_LOGE(TAG, "Failed to create refresh task");
+            return;
+        }
         BaseType_t created = xTaskCreatePinnedToCore(AnimationTaskEntry, "grokbot_anim", 12 * 1024,
                                                      this, 1, &task_handle_, 0);
         if (created != pdPASS) {
@@ -274,6 +343,9 @@ void GrokbotDisplay::SetStatus(const char* status) {
     assets_update_in_progress_ = loading_assets;
     portEXIT_CRITICAL(&mailbox_mux_);
     LvglDisplay::SetStatus(status);
+    // Startup runs at priority 1; raise decoding only after the application enters standby.
+    if (task_handle_ && status && strcmp(status, Lang::Strings::STANDBY) == 0)
+        vTaskPrioritySet(task_handle_, 5);
 }
 
 void GrokbotDisplay::SetChatMessage(const char* role, const char* content) {
@@ -354,6 +426,8 @@ bool GrokbotDisplay::EnsurePlayer() {
         atlas_data_ = nullptr;
         atlas_size_ = 0;
         has_selected_ = false;
+        heap_caps_free(start_frames_);
+        start_frames_ = nullptr;
         if (!player_.init(data, size)) {
             return false;
         }
@@ -373,7 +447,22 @@ bool GrokbotDisplay::EnsurePlayer() {
 
         if (frame_width_ != player_.width() || frame_height_ != player_.height() ||
             packed_ == nullptr || delta_ == nullptr || decompressor_ == nullptr ||
-            image_buffers_[0] == nullptr || image_buffers_[1] == nullptr) {
+            image_buffers_[0] == nullptr || image_buffers_[1] == nullptr ||
+            displayed_packed_ == nullptr || fade_from_ == nullptr || blend_lut_ == nullptr) {
+            DisplayLockGuard lock(this);
+            if (!lock)
+                return false;
+            if (have_displayed_frame_) {
+                const int shown = pipeline_.write ^ 1;
+                retired_image_ = image_buffers_[shown];
+                retired_desc_ = image_descs_[shown];
+                lv_image_set_src(emoji_image_, &retired_desc_);
+                image_buffers_[shown] = nullptr;
+                have_displayed_frame_ = false;
+            }
+            heap_caps_free(displayed_packed_);
+            heap_caps_free(fade_from_);
+            heap_caps_free(blend_lut_);
             heap_caps_free(packed_);
             heap_caps_free(delta_);
             heap_caps_free(decompressor_);
@@ -391,6 +480,12 @@ bool GrokbotDisplay::EnsurePlayer() {
             image_size_ = new_image_size;
             packed_ = static_cast<uint8_t*>(
                 heap_caps_aligned_alloc(64, packed_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            displayed_packed_ = static_cast<uint8_t*>(
+                heap_caps_aligned_alloc(64, packed_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            fade_from_ = static_cast<uint8_t*>(
+                heap_caps_aligned_alloc(64, packed_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            blend_lut_ = static_cast<uint8_t*>(heap_caps_malloc(
+                (kGrokBotFadeFrames + 1) * 256, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
             delta_ = static_cast<uint8_t*>(
                 heap_caps_aligned_alloc(64, packed_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
             decompressor_ = static_cast<tinfl_decompressor*>(heap_caps_malloc(
@@ -404,10 +499,17 @@ bool GrokbotDisplay::EnsurePlayer() {
             image_buffers_[1] = static_cast<uint16_t*>(
                 heap_caps_aligned_alloc(64, image_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
             if (packed_ == nullptr || delta_ == nullptr || decompressor_ == nullptr ||
-                image_buffers_[0] == nullptr || image_buffers_[1] == nullptr) {
+                image_buffers_[0] == nullptr || image_buffers_[1] == nullptr ||
+                displayed_packed_ == nullptr || fade_from_ == nullptr || blend_lut_ == nullptr) {
                 ESP_LOGE(TAG,
                          "PSRAM allocation failed: packed=%p delta=%p decompressor=%p images=%p/%p",
                          packed_, delta_, decompressor_, image_buffers_[0], image_buffers_[1]);
+                heap_caps_free(displayed_packed_);
+                heap_caps_free(fade_from_);
+                heap_caps_free(blend_lut_);
+                displayed_packed_ = nullptr;
+                fade_from_ = nullptr;
+                blend_lut_ = nullptr;
                 heap_caps_free(packed_);
                 heap_caps_free(delta_);
                 heap_caps_free(decompressor_);
@@ -425,6 +527,12 @@ bool GrokbotDisplay::EnsurePlayer() {
                 player_ready_ = false;
                 return false;
             }
+            have_displayed_frame_ = false;
+            fade_step_ = kGrokBotFadeFrames;
+            for (unsigned step = 0; step <= kGrokBotFadeFrames; ++step)
+                for (unsigned from = 0; from < 16; ++from)
+                    for (unsigned to = 0; to < 16; ++to)
+                        blend_lut_[step * 256 + from * 16 + to] = GrokBotBlendGray(from, to, step);
             memset(packed_, 0, packed_size_);
             memset(delta_, 0, packed_size_);
             memset(image_buffers_[0], 0, image_size_);
@@ -432,7 +540,7 @@ bool GrokbotDisplay::EnsurePlayer() {
 
             uint16_t gray_lut[16] = {};
             for (int i = 0; i < 16; ++i) {
-                const uint8_t value = static_cast<uint8_t>(i * 17);
+                const uint8_t value = GrokBotDisplayGray(i);
                 gray_lut[i] = static_cast<uint16_t>(((value & 0xF8) << 8) | ((value & 0xFC) << 3) |
                                                     (value >> 3));
             }
@@ -453,6 +561,8 @@ bool GrokbotDisplay::EnsurePlayer() {
                 image_descs_[i].data = reinterpret_cast<const uint8_t*>(image_buffers_[i]);
             }
         }
+        if (!CacheStartFrames())
+            return false;
         atlas_data_ = data;
         atlas_size_ = size;
         player_ready_ = true;
@@ -486,58 +596,141 @@ bool GrokbotDisplay::DecodeFrame(const GrokBotPlayer::FrameInfo& frame, bool exp
                  static_cast<unsigned>(output_size), static_cast<unsigned>(packed_size_));
         return false;
     }
-    if (!frame.delta) {
-        memcpy(packed_, delta_, packed_size_);
+    if (expand && fade_step_ >= kGrokBotFadeFrames) {
+        // Fuse XOR and expansion: packed PSRAM is read once and no candidate snapshot is copied.
+        GrokBotExpandDelta(packed_, delta_,
+                           reinterpret_cast<uint32_t*>(image_buffers_[pipeline_.write]),
+                           packed_size_, pair_lut_, frame.delta);
     } else {
-        auto* packed_words = reinterpret_cast<uint32_t*>(packed_);
-        auto* delta_words = reinterpret_cast<uint32_t*>(delta_);
-        const size_t word_count = packed_size_ / sizeof(uint32_t);
-        for (size_t i = 0; i < word_count; ++i) {
-            packed_words[i] ^= delta_words[i];
+        if (!frame.delta) {
+            memcpy(packed_, delta_, packed_size_);
+        } else {
+            auto* words = reinterpret_cast<uint32_t*>(packed_);
+            const auto* deltas = reinterpret_cast<const uint32_t*>(delta_);
+            const size_t count = packed_size_ / sizeof(uint32_t);
+            for (size_t i = 0; i < count; ++i)
+                words[i] ^= deltas[i];
+            for (size_t i = count * sizeof(uint32_t); i < packed_size_; ++i)
+                packed_[i] ^= delta_[i];
         }
-        for (size_t i = word_count * sizeof(uint32_t); i < packed_size_; ++i) {
-            packed_[i] ^= delta_[i];
-        }
-    }
-    if (expand) {
-        ExpandPackedFrame();
+        if (expand)
+            ExpandPackedFrame();
     }
     decode_us_total_ += NowUs() - start_us;
     return true;
 }
 
 void GrokbotDisplay::ExpandPackedFrame() {
-    auto* pixels = image_buffers_[write_buffer_];
+    auto* pixels = image_buffers_[pipeline_.write];
     if (pixels == nullptr || packed_ == nullptr) {
         return;
     }
     auto* pixels32 = reinterpret_cast<uint32_t*>(pixels);
-    const size_t pixel_pairs = packed_size_;
-    for (size_t i = 0; i < pixel_pairs; ++i) {
-        pixels32[i] = pair_lut_[packed_[i]];
+    if (fade_step_ < kGrokBotFadeFrames) {
+        const auto* lut = blend_lut_ + (fade_step_ + 1) * 256;
+        for (size_t i = 0; i < packed_size_; ++i) {
+            const uint8_t from = fade_from_[i], to = packed_[i];
+            const uint8_t mixed = GrokBotBlendPacked(from, to, lut);
+            delta_[i] = mixed;
+            pixels32[i] = pair_lut_[mixed];
+        }
+    } else {
+        for (size_t i = 0; i < packed_size_; ++i) {
+            const uint8_t value = packed_[i];
+            delta_[i] = value;
+            pixels32[i] = pair_lut_[value];
+        }
     }
 }
 
 bool GrokbotDisplay::PresentFrame() {
-    if (emoji_image_ == nullptr || image_buffers_[write_buffer_] == nullptr) {
+    if (emoji_image_ == nullptr || image_buffers_[pipeline_.write] == nullptr)
         return false;
-    }
-    WaitForTeFrame(std::max(1, target_fps_.load()));
     const int64_t start_us = NowUs();
-    const int presented = write_buffer_;
-    DisplayLockGuard lock(this);
-    if (!lock) {
+    if (xSemaphoreTake(refresh_ready_, pdMS_TO_TICKS(1000)) != pdTRUE)
         return false;
+    const int fps = std::max(1, target_fps_.load());
+    // A sleeping frame must not hold the LVGL lock while waiting 200ms.
+    if (fps < kNormalFps)
+        WaitForTeFrame(fps);
+    {
+        DisplayLockGuard lock(this);
+        if (!lock) {
+            xSemaphoreGive(refresh_ready_);
+            return false;
+        }
+        pipeline_.Complete();
+        const int presented = pipeline_.Submit();
+        lv_image_set_src(emoji_image_, &image_descs_[presented]);
+        lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        heap_caps_free(retired_image_);
+        retired_image_ = nullptr;
+        refresh_fps_ = fps;
+        refresh_pending_.store(true);
+        auto* timer = lv_display_get_refr_timer(display_);
+        // The dedicated presenter avoids the port task's mandatory sleep before each frame.
+        lv_timer_pause(timer);
+        xTaskNotifyGive(refresh_task_);
+        // Commit the prepared packed snapshot only after submission succeeds.
+        std::swap(displayed_packed_, delta_);
     }
-    write_buffer_ ^= 1;
-    lv_image_set_src(emoji_image_, &image_descs_[presented]);
-    lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    have_displayed_frame_ = true;
+    if (fade_step_ < kGrokBotFadeFrames)
+        ++fade_step_;
     present_us_total_ += NowUs() - start_us;
+    return true;
+}
+
+bool GrokbotDisplay::CacheStartFrames() {
+    if (packed_size_ > SIZE_MAX / static_cast<size_t>(player_.clip_count()))
+        return false;
+    const size_t cache_size = packed_size_ * player_.clip_count();
+    start_frames_ = static_cast<uint8_t*>(
+        heap_caps_aligned_alloc(64, cache_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!start_frames_) {
+        ESP_LOGW(TAG, "Start frame cache unavailable; using keyframe reconstruction");
+        return true;
+    }
+    const int64_t began = NowUs();
+    for (int clip = 0; clip < player_.clip_count(); ++clip) {
+        player_.select(clip);
+        const int target = player_.start_frame();
+        GrokBotPlayer::FrameInfo frame;
+        int key = target;
+        while (key > 0) {
+            if (!player_.frame_info(key, &frame))
+                return false;
+            if (!frame.delta)
+                break;
+            --key;
+        }
+        for (int index = key; index <= target; ++index)
+            if (!player_.frame_info(index, &frame) || (index == key && frame.delta) ||
+                !DecodeFrame(frame, false))
+                return false;
+        memcpy(start_frames_ + clip * packed_size_, packed_, packed_size_);
+        // Startup cache work must give audio and board initialization time to run.
+        vTaskDelay(1);
+    }
+    player_.select(0);
+    packed_index_ = -1;
+    decode_us_total_ = 0;
+    ESP_LOGI(TAG, "Cached %d start frames: %u bytes PSRAM in %lldms; remaining=%u",
+             player_.clip_count(), static_cast<unsigned>(cache_size), (NowUs() - began) / 1000,
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     return true;
 }
 
 bool GrokbotDisplay::RebuildCurrentFrame() {
     const int target = player_.current_index();
+    const uint8_t* cached = GrokBotCachedStart(start_frames_, player_.selected_index(), target,
+                                               player_.start_frame(), packed_size_);
+    if (cached) {
+        memcpy(packed_, cached, packed_size_);
+        packed_index_ = target;
+        ExpandPackedFrame();
+        return PresentFrame();
+    }
     GrokBotPlayer::FrameInfo frame = {};
     int key = target;
     while (key > 0) {
@@ -557,9 +750,24 @@ bool GrokbotDisplay::RebuildCurrentFrame() {
     return PresentFrame();
 }
 
+void GrokbotDisplay::RefreshTaskEntry(void* arg) {
+    auto* self = static_cast<GrokbotDisplay*>(arg);
+    while (self->running_.load()) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        {
+            DisplayLockGuard lock(self);
+            if (lock && self->running_.load())
+                lv_refr_now(self->display_);
+        }
+        // Let status/chat callers acquire the shared display mutex between refreshes.
+        vTaskDelay(1);
+    }
+    vTaskSuspend(nullptr);
+}
+
 void GrokbotDisplay::AnimationTaskEntry(void* arg) {
     static_cast<GrokbotDisplay*>(arg)->AnimationTask();
-    vTaskDelete(nullptr);
+    vTaskSuspend(nullptr);
 }
 
 void GrokbotDisplay::AnimationTask() {
@@ -599,10 +807,17 @@ void GrokbotDisplay::AnimationTask() {
             continue;
         }
         event_pending = false;
+        bool clip_changed = false;
         if (!has_selected_ || next.seq != directive.seq) {
+            const bool same_clip = has_selected_ && next.clip && player_.selected_name() &&
+                                   strcmp(next.clip, player_.selected_name()) == 0;
             if (!next.clip || !player_.select_name(next.clip)) {
                 vTaskDelay(pdMS_TO_TICKS(250));
                 continue;
+            }
+            if (have_displayed_frame_) {
+                memcpy(fade_from_, displayed_packed_, packed_size_);
+                fade_step_ = 0;
             }
             directive = next;
             const int upper =
@@ -611,12 +826,15 @@ void GrokbotDisplay::AnimationTask() {
                 GrokBotFrameLower(player_.start_frame(), upper, directive.from_frame_zero));
             reverse_ = false;
             has_selected_ = true;
-            packed_index_ = -1;
+            if (!same_clip)
+                packed_index_ = -1;
             once_done = false;
-            ESP_LOGI(TAG, "Animation -> %s", directive.clip);
+            clip_changed = true;
         }
-        const int fps =
-            power_save && strcmp(directive.clip, "sleeping") == 0 ? kPowerSaveFps : kNormalFps;
+        const int fps = power_save && strcmp(directive.clip, "sleeping") == 0 &&
+                                fade_step_ >= kGrokBotFadeFrames
+                            ? kPowerSaveFps
+                            : kNormalFps;
         target_fps_.store(fps);
         const int64_t frame_us = 1000000LL / fps;
         if (once_done) {
@@ -652,6 +870,8 @@ void GrokbotDisplay::AnimationTask() {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        if (clip_changed)
+            ESP_LOGI(TAG, "Animation -> %s", directive.clip);
         const int upper = GrokBotFrameUpper(player_.selected_frame_count(), directive.max_frames);
         const int lower =
             GrokBotFrameLower(player_.start_frame(), upper, directive.from_frame_zero);
@@ -670,19 +890,21 @@ void GrokbotDisplay::AnimationTask() {
         render_total_us += NowUs() - render_start_us;
         ++rendered_frames;
 
-        next_frame_us += frame_us;
-        const int64_t now = NowUs();
-        if (next_frame_us > now) {
-            const int64_t wait_us = next_frame_us - now;
-            if (wait_us >= 2000) {
-                vTaskDelay(pdMS_TO_TICKS((wait_us + 500) / 1000));
-            } else {
-                taskYIELD();
+        if (!te_isr_installed_) {
+            next_frame_us += frame_us;
+            const int64_t now = NowUs();
+            if (next_frame_us > now) {
+                const int64_t wait_us = next_frame_us - now;
+                if (wait_us >= 2000) {
+                    vTaskDelay(pdMS_TO_TICKS((wait_us + 500) / 1000));
+                } else {
+                    taskYIELD();
+                }
+            } else if (now - next_frame_us > frame_us) {
+                next_frame_us = now;
             }
-        } else if (now - next_frame_us > frame_us) {
-            next_frame_us = now;
         }
-
+        const int64_t now = NowUs();
         if (now - report_start_us >= 5000000) {
             const int64_t elapsed_us = now - report_start_us;
             const uint32_t fps_hundredths = static_cast<uint32_t>(
@@ -703,15 +925,31 @@ void GrokbotDisplay::AnimationTask() {
                 te_wait_us_total_.exchange(0, std::memory_order_relaxed);
             const uint32_t avg_te_wait_us =
                 te_waits > 0 ? static_cast<uint32_t>(te_wait_us_total / te_waits) : 0;
+            uint32_t intervals[256];
+            portENTER_CRITICAL(&mailbox_mux_);
+            const unsigned count = interval_count_;
+            const unsigned slow = slow_frames_;
+            const uint32_t lag_max = te_lag_max_us_;
+            te_lag_max_us_ = 0;
+            memcpy(intervals, frame_intervals_, count * sizeof(uint32_t));
+            interval_count_ = 0;
+            slow_frames_ = 0;
+            portEXIT_CRITICAL(&mailbox_mux_);
+            std::sort(intervals, intervals + count);
+            const uint32_t p50 = count ? intervals[(count - 1) * 50 / 100] : 0;
+            const uint32_t p95 = count ? intervals[(count - 1) * 95 / 100] : 0;
+            const uint32_t maximum = count ? intervals[count - 1] : 0;
             ESP_LOGI(TAG,
                      "Animation fps=%u.%02u render=%uus decode=%uus present=%uus "
-                     "te_wait=%uus te_hz=%u te_timeout=%u state=%s",
+                     "te_wait=%uus te_hz=%u te_timeout=%u interval_p50=%uus interval_p95=%uus "
+                     "interval_max=%uus over40ms=%u te_lag_max=%uus state=%s",
                      fps_hundredths / 100, fps_hundredths % 100,
                      static_cast<unsigned>(avg_render_us), static_cast<unsigned>(avg_decode_us),
                      static_cast<unsigned>(avg_present_us), static_cast<unsigned>(avg_te_wait_us),
                      static_cast<unsigned>(
                          (static_cast<uint64_t>(te_edges) * 1000000 + elapsed_us / 2) / elapsed_us),
-                     static_cast<unsigned>(te_timeouts), player_.selected_name());
+                     static_cast<unsigned>(te_timeouts), p50, p95, maximum, slow, lag_max,
+                     player_.selected_name());
             report_start_us = now;
             render_total_us = 0;
             decode_us_total_ = 0;

@@ -57,9 +57,11 @@ class GrokBotPreviewTests(unittest.TestCase):
         sleeping = [frame for frame in frames if 6133 <= frame[0] < 10000]
         self.assertEqual(len(sleeping), 116)
         self.assertTrue(all(clip == "sleeping" for _, clip, _ in sleeping))
+        self.assertEqual([index for _, _, index in sleeping[:6]], list(range(2, 8)))
+        sleeping = sleeping[6:]
         for offset in range(0, len(sleeping) - 6, 6):
             group = sleeping[offset:offset + 6]
-            self.assertEqual([index for _, _, index in group], [2 + offset // 6] * 6)
+            self.assertEqual([index for _, _, index in group], [8 + offset // 6] * 6)
             self.assertEqual(sleeping[offset + 6][0] - group[0][0], 200)
         waking = [frame for frame in frames if 10000 <= frame[0] < 10200]
         self.assertEqual([index for _, clip, index in waking], list(range(2, 8)))
@@ -72,6 +74,27 @@ class GrokBotPreviewTests(unittest.TestCase):
         self.assertTrue(all(clip == "waking" for ms, clip, _ in frames if 21000 <= ms < 23366))
         self.assertEqual(next(clip for ms, clip, _ in frames if ms == 23366), "thinking")
 
+
+    def test_six_frame_blend_and_interrupted_fade(self):
+        preview = self.preview
+        np = preview.np
+
+        class Atlas:
+            width = 2
+            def get_clip_frames(self, name, size):
+                return [np.full((2, 2), 255 if name == "white" else 0, dtype=np.uint8)]
+
+        frames = [(0, "black", 0)] + [(33 * i, "white", 0) for i in range(1, 7)]
+        values = [int(gray[0, 0]) for gray in preview.blended_frames(Atlas(), frames, 2)]
+        self.assertEqual(values, preview.DISPLAY_GRAY_LUT[[0, 3, 5, 8, 10, 13, 15]].tolist())
+        interrupted = frames[:3] + [(100, "black", 0)]
+        values = [int(gray[0, 0]) for gray in preview.blended_frames(Atlas(), interrupted, 2)]
+        self.assertEqual(values[-1], int(preview.DISPLAY_GRAY_LUT[4]))
+        # A new directive can restart the same clip: sequence, not name, drives fading.
+        restart = preview.SimulationFrames([(0, "white", 0), (33, "black", 0), (66, "black", 0)])
+        restart.sequences = [1, 2, 3]
+        values = [int(gray[0, 0]) for gray in preview.blended_frames(Atlas(), restart, 2)]
+        self.assertEqual(values, preview.DISPLAY_GRAY_LUT[[15, 13, 11]].tolist())
 
     def test_invalid_render_arguments_exit_before_creating_output(self):
         root = self.root

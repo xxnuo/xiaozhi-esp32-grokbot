@@ -26,6 +26,7 @@ FRAME_HEADER = struct.Struct("<IB3x")
 FRAME_INDEX = struct.Struct("<II")
 
 SCENARIOS = ("boot_idle", "conversation", "wake_from_sleep")
+DISPLAY_GRAY_LUT = np.rint(255 * (np.arange(16) / 15) ** (1 / 2.2)).astype(np.uint8)
 
 
 class AtlasDecoder:
@@ -125,6 +126,10 @@ def compile_simulator(root: Path) -> Path:
     return binary
 
 
+class SimulationFrames(list):
+    sequences: list[int]
+
+
 def run_simulation(
     binary: Path, atlas_path: Path, scenario: str, seed: int
 ) -> list[tuple[int, str, int]]:
@@ -134,11 +139,13 @@ def run_simulation(
         capture_output=True,
         text=True,
     )
-    frames: list[tuple[int, str, int]] = []
+    frames = SimulationFrames()
+    frames.sequences = []
     for line in res.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 3:
+        if len(parts) == 4:
             frames.append((int(parts[0]), parts[1], int(parts[2])))
+            frames.sequences.append(int(parts[3]))
     return frames
 
 
@@ -226,6 +233,30 @@ def annotate_frame(gray: np.ndarray, ms: int, clip: str, frame_idx: int) -> np.n
     return np.asarray(img, dtype=np.uint8)
 
 
+def blended_frames(atlas: AtlasDecoder, frames: list[tuple[int, str, int]], size: int):
+    previous = None
+    source = None
+    last_sequence = None
+    step = 6
+    for i, (_, clip, frame_idx) in enumerate(frames):
+        sequence = frames.sequences[i] if hasattr(frames, "sequences") else clip
+        if previous is not None and sequence != last_sequence:
+            source = previous.copy()
+            step = 0
+        gray = atlas.get_clip_frames(clip, atlas.width)[frame_idx]
+        if step < 6:
+            step += 1
+            # Match the device's rounded 4-bit blend before preview downsampling.
+            gray = (((source.astype(np.uint16) // 17) * (6 - step) +
+                     (gray.astype(np.uint16) // 17) * step + 3) // 6 * 17).astype(np.uint8)
+        previous = gray
+        last_sequence = sequence
+        gray = DISPLAY_GRAY_LUT[gray // 17]
+        if size != atlas.width:
+            gray = np.asarray(Image.fromarray(gray).resize((size, size), Image.Resampling.BILINEAR))
+        yield gray
+
+
 def render_contact_sheet(
     path: Path,
     atlas: AtlasDecoder,
@@ -254,8 +285,10 @@ def render_contact_sheet(
         span = tr["end_step"] - tr["start_step"]
         sample_step = tr["start_step"] + min(span // 2, 25)
         _, clip_name, sample_frame_idx = frames[sample_step]
-        clip_frames = atlas.get_clip_frames(clip_name, thumb_size)
-        frame_gray = clip_frames[sample_frame_idx]
+        clip_frames = atlas.get_clip_frames(clip_name, atlas.width)
+        frame_gray = DISPLAY_GRAY_LUT[clip_frames[sample_frame_idx] // 17]
+        frame_gray = np.asarray(Image.fromarray(frame_gray).resize(
+            (thumb_size, thumb_size), Image.Resampling.BILINEAR))
 
         thumb_img = Image.fromarray(frame_gray, mode="L")
         sheet.paste(thumb_img, (x0, y0))
@@ -316,12 +349,16 @@ def render_video(
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     assert proc.stdin is not None
     try:
-        for i in indices:
+        selected = iter(indices)
+        next_index = next(selected, None)
+        for i, gray in enumerate(blended_frames(atlas, frames, size)):
+            if i != next_index:
+                continue
             ms, clip_name, frame_idx = frames[i]
-            clip_frames = atlas.get_clip_frames(clip_name, size)
-            gray = clip_frames[frame_idx]
             annotated = annotate_frame(gray, ms, clip_name, frame_idx)
-            proc.stdin.write(annotated.tobytes())
+            while next_index == i:
+                proc.stdin.write(annotated.tobytes())
+                next_index = next(selected, None)
     finally:
         proc.stdin.close()
         ret = proc.wait()
