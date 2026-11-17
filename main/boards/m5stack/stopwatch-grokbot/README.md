@@ -96,11 +96,23 @@ volume behavior. No GrokBot showcase controls are assigned to them.
 python scripts/build.py m5stack/stopwatch-grokbot --name m5stack-stopwatch-grokbot
 ```
 
-The checked-in atlas can be regenerated from the full StopWatch-GrokBot atlas:
+The checked-in 360x360 atlas can be baked directly from the GrokBot vector engine
+with 4x supersampling (`1440x1440` -> anti-aliased `360x360`):
 
 ```sh
-python scripts/build_grokbot_subset.py \
-  ../Stopwatch-GrokBot/main/grokbot.atlas \
+(cd .tmp && pnpm add puppeteer-core)
+node scripts/bake_grokbot_atlas.mjs \
+  --grokbot-root research/Stopwatch-GrokBot \
+  --frames-dir .tmp/grokbot-frames-1440 \
+  --output main/boards/m5stack/stopwatch-grokbot/assets/grokbot.atlas \
+  --size 360 --supersample 4 --max-size 0x700000
+```
+
+Or re-encoded from an existing baked directory / full StopWatch-GrokBot atlas:
+
+```sh
+uv run --with numpy --with pillow python scripts/build_grokbot_subset.py \
+  .tmp/grokbot-frames-1440 \
   main/boards/m5stack/stopwatch-grokbot/assets/grokbot.atlas \
   --size 360 --max-size 0x700000
 ```

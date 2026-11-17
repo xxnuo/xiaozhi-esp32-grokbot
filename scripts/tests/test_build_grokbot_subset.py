@@ -1,4 +1,5 @@
 import struct
+import json
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ from scripts.build_grokbot_subset import (
     FRAME_INDEX,
     GLOBAL_HEADER,
     XIAOZHI_STATES,
+    downsample_supersampled_gray,
     rebuild_clip,
     unpack_frame,
 )
@@ -167,6 +169,126 @@ class BuildGrokbotSubsetTest(unittest.TestCase):
         self.assertEqual(int(pixels0[-1, -1]), 12)
         self.assertEqual(int(pixels1[0, 0]), 15)
         self.assertEqual(int(pixels1[-1, -1]), 0)
+
+    def test_baked_directory_encodes_supersampled_frames(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy is required for baked directory fixture test")
+
+        hi_frame = np.zeros((16, 16), dtype=np.uint8)
+        hi_frame[:, 6:] = 255
+        aa = downsample_supersampled_gray(hi_frame, 4)
+        self.assertEqual(aa.shape, (4, 4))
+        self.assertEqual(int(aa[0, 0]), 0)
+        self.assertEqual(int(aa[0, 1]), 128)
+        self.assertEqual(int(aa[0, 2]), 255)
+        self.assertEqual(int(aa[0, 3]), 255)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baked_dir = root / "baked"
+            baked_dir.mkdir()
+            output = root / "baked.atlas"
+            states_meta = []
+            for name in XIAOZHI_STATES:
+                raw = np.zeros((3, 4, 4), dtype=np.uint8)
+                raw[1, :, :2] = 136
+                raw[2, :, :] = 255
+                (baked_dir / f"{name}.raw").write_bytes(raw.tobytes())
+                states_meta.append({"state": name, "count": 3, "start_frame": 2})
+            (baked_dir / "summary.json").write_text(
+                json.dumps({"fps": 30, "size": 4, "supersample": 4, "states": states_meta}),
+                encoding="utf-8",
+            )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "build_grokbot_subset.py"),
+                    str(baked_dir),
+                    str(output),
+                    "--size",
+                    "4",
+                    "--max-size",
+                    "0x10000",
+                ],
+                check=True,
+            )
+
+            data = output.read_bytes()
+            magic, version, width, height, fps, count, _ = GLOBAL_HEADER.unpack_from(data)
+            self.assertEqual((magic, version, width, height, fps), (b"GBZ1", 1, 4, 4, 30))
+            self.assertEqual(count, len(XIAOZHI_STATES))
+            _, frames, start_frame, _, _, packed_size = CLIP_HEADER.unpack_from(
+                data, GLOBAL_HEADER.size
+            )
+            self.assertEqual((frames, start_frame, packed_size), (3, 2, 8))
+
+    def test_supersampled_box_filter_preserves_moving_thin_line_brightness(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy is required for thin-line shift invariance test")
+
+        vertical_sums = set()
+        horizontal_sums = set()
+        for pos in range(4, 28):
+            v_hi = np.zeros((32, 32), dtype=np.uint8)
+            v_hi[:, pos] = 240
+            v_lo = downsample_supersampled_gray(v_hi, 4)
+            vertical_sums.add(int(v_lo.sum()))
+
+            h_hi = np.zeros((32, 32), dtype=np.uint8)
+            h_hi[pos, :] = 240
+            h_lo = downsample_supersampled_gray(h_hi, 4)
+            horizontal_sums.add(int(h_lo.sum()))
+
+        self.assertEqual(len(vertical_sums), 1)
+        self.assertEqual(len(horizontal_sums), 1)
+        self.assertEqual(vertical_sums, {8 * 60})
+        self.assertEqual(horizontal_sums, {8 * 60})
+
+    def test_bake_script_vector_precision_patches(self):
+        script_url = (ROOT / "scripts" / "bake_grokbot_atlas.mjs").as_uri()
+        upstream_player = (
+            ROOT / "research" / "Stopwatch-GrokBot" / "third_party" / "grokbot" / "grok-player.js"
+        )
+        node_code = f"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import {{ upgradeVectorPrecision }} from {json.dumps(script_url)};
+
+const fixture = [
+  'const JM = .02, eT = 16, tT = .015, nT = 400, rT = 512;',
+  'const yT = 192, kT = Math.PI / 48;',
+  'const kE = hM(192);',
+  '    $h = Array.from({{ length: 96 }}, (e, t) => {{ // $h: 96-gon ring',
+  '      const n = t / 96 * TAU;',
+  '      return [x + Math.cos(n) * x, x + Math.sin(n) * x];',
+  '    }});',
+].join('\\n');
+
+const patched = upgradeVectorPrecision(fixture);
+assert.ok(patched.includes('const JM = .0005, eT = 20, tT = .003, nT = 1200'));
+assert.ok(patched.includes('const yT = 768, kT = Math.PI / 192;'));
+assert.ok(patched.includes('const kE = hM(768);'));
+assert.ok(patched.includes('$h = Array.from({{ length: 384 }}, (e, t) => {{'));
+assert.ok(patched.includes('const n = t / 384 * TAU;'));
+assert.ok(!patched.includes('length: 96'));
+
+assert.throws(() => upgradeVectorPrecision(patched), /expected exactly 1 match/);
+assert.throws(() => upgradeVectorPrecision(fixture + '\\nconst kE = hM(192);'), /expected exactly 1 match/);
+
+const upstreamPath = {json.dumps(str(upstream_player))};
+if (fs.existsSync(upstreamPath)) {{
+  const upstream = fs.readFileSync(upstreamPath, 'utf8');
+  const upPatched = upgradeVectorPrecision(upstream);
+  assert.ok(upPatched.includes('$h = Array.from({{ length: 384 }}'));
+  assert.ok(!upPatched.includes('$h = Array.from({{ length: 96 }}'));
+}}
+"""
+        subprocess.run(["node", "--input-type=module", "-e", node_code], check=True)
 
 
 if __name__ == "__main__":
