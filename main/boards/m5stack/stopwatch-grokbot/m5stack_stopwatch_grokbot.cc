@@ -1,17 +1,21 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <wifi_manager.h>
+#include <atomic>
 #include "M5IOE1.h"
 #include "M5PM1.h"
 #include "application.h"
 #include "assets/lang_config.h"
 #include "backlight.h"
+#include "bmi270_api.h"
 #include "button.h"
 #include "codecs/es8311_audio_codec.h"
 #include "config.h"
 #include "display/grokbot_display.h"
 #include "esp_lcd_co5300.h"
+#include "grokbot_inputs.h"
 #include "wifi_board.h"
 
 #define TAG "M5StackStopwatchGrokBot"
@@ -23,11 +27,11 @@ static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
     {0xFE, (uint8_t[]){0x00}, 0, 0},
     {0xC4, (uint8_t[]){0x80}, 1, 0},
     {0x3A, (uint8_t[]){0x55}, 1, 10},  // RGB565
-    // Match the M5Stack StopWatch panel setup: TE pulses at the configured
-    // tear line just below the 466 visible rows. This keeps the animation
-    // flush aligned to the panel's vertical blanking interval.
-    {0x35, (uint8_t[]){0x80}, 1, 10},
-    {0x44, (uint8_t[]){0x01, 0xD2}, 2, 10},  // Tear line = 466
+    // Keep scanning ahead of the writer: a 360-row update takes longer than
+    // scanning those rows. Line 128 leaves about 2.7ms at the top and 27ms
+    // until the next scan reaches the image bottom.
+    {0x35, (uint8_t[]){0x00}, 1, 10},  // Vertical TE only, positive pulse
+    {0x44, (uint8_t[]){0x00, GrokbotDisplay::kTeScanline}, 2, 10},  // Tear line = 128
     {0x53, (uint8_t[]){0x20}, 1, 10},
     {0x51, (uint8_t[]){0xFF}, 1, 10},
     {0x63, (uint8_t[]){0xFF}, 1, 10},
@@ -71,6 +75,170 @@ private:
     Button button2_;
     GrokbotDisplay* display_;
     StopwatchBacklight* backlight_;
+    i2c_master_dev_handle_t touch_ = nullptr;
+    bmi270_handle_t imu_ = nullptr;
+    std::atomic<bool> interaction_pending_{false};
+
+    void QueueInteraction(GrokbotInputs::Reaction reaction, int64_t now_ms) {
+        if (reaction == GrokbotInputs::Reaction::kNone ||
+            Application::GetInstance().GetDeviceState() != kDeviceStateIdle ||
+            interaction_pending_.exchange(true)) {
+            return;
+        }
+        const char* emotion = "curious";
+        switch (reaction) {
+            case GrokbotInputs::Reaction::kTap:
+                emotion = "happy";
+                break;
+            case GrokbotInputs::Reaction::kStroke:
+                emotion = "loving";
+                break;
+            case GrokbotInputs::Reaction::kShake:
+                emotion = "confused";
+                break;
+            default:
+                break;
+        }
+        Application::GetInstance().Schedule([this, emotion, now_ms]() {
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle &&
+                esp_timer_get_time() / 1000 - now_ms < 400) {
+                if (display_->OnInteraction(emotion))
+                    ESP_LOGI(TAG, "Local interaction accepted: %s", emotion);
+            }
+            interaction_pending_.store(false);
+        });
+    }
+
+    void InputTask() {
+        GrokbotInputs inputs;
+        unsigned imu_failures = 0;
+        bool touch_seen = false;
+        bool imu_sample_seen = false;
+        while (true) {
+            const int64_t now_ms = esp_timer_get_time() / 1000;
+            if (touch_) {
+                // CST820B may NACK while asleep, just like M5GFX's CST816S driver.
+                // Probe first so an absent/sleeping controller does not flood I2C error logs.
+                const auto probe = i2c_master_probe(i2c_bus_, 0x15, 10);
+                if (probe == ESP_OK) {
+                    const uint8_t reg = 0x02;
+                    uint8_t data[5] = {};
+                    if (i2c_master_transmit_receive(touch_, &reg, 1, data, sizeof(data), 20) ==
+                        ESP_OK) {
+                        const int x = ((data[1] & 0x0f) << 8) | data[2];
+                        const int y = ((data[3] & 0x0f) << 8) | data[4];
+                        if (data[0] <= 1 &&
+                            (!data[0] || (x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT))) {
+                            if (!touch_seen) {
+                                ESP_LOGI(TAG, "CST820B responding at 0x15");
+                                touch_seen = true;
+                            }
+                            QueueInteraction(inputs.Touch(data[0] == 1, x, y, now_ms), now_ms);
+                        } else {
+                            inputs.CancelTouch();
+                        }
+                    } else {
+                        inputs.CancelTouch();
+                    }
+                } else if (probe == ESP_ERR_NOT_FOUND) {
+                    QueueInteraction(inputs.Touch(false, 0, 0, now_ms), now_ms);
+                } else {
+                    inputs.CancelTouch();
+                }
+            }
+            if (imu_) {
+                struct bmi2_sens_data sample = {};
+                if (bmi2_get_sensor_data(&sample, imu_) == BMI2_OK) {
+                    imu_failures = 0;
+                    const int x_mg = int(sample.acc.x) * 1000 / 8192;
+                    const int y_mg = int(sample.acc.y) * 1000 / 8192;
+                    const int z_mg = int(sample.acc.z) * 1000 / 8192;
+                    const int64_t norm =
+                        int64_t(x_mg) * x_mg + int64_t(y_mg) * y_mg + int64_t(z_mg) * z_mg;
+                    if (!imu_sample_seen && norm >= 800 * 800 && norm <= 1200 * 1200) {
+                        ESP_LOGI(TAG, "BMI270 first valid acceleration: x=%d y=%d z=%d mg", x_mg,
+                                 y_mg, z_mg);
+                        imu_sample_seen = true;
+                    }
+                    QueueInteraction(inputs.Motion(x_mg, y_mg, z_mg, now_ms), now_ms);
+                } else if (++imu_failures >= 5) {
+                    ESP_LOGW(TAG,
+                             "BMI270 unavailable after repeated read errors; disabling motion");
+                    bmi270_sensor_del(&imu_);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+    void InitializeInputs() {
+        m5ioe1_err_t touch_reset = M5IOE1_OK;
+        ioe_.pinModeWithRes(IOE_PIN_TOUCH_RST, OUTPUT, &touch_reset);
+        if (touch_reset == M5IOE1_OK)
+            touch_reset = ioe_.setDriveMode(IOE_PIN_TOUCH_RST, M5IOE1_DRIVE_PUSHPULL);
+        if (touch_reset == M5IOE1_OK)
+            ioe_.digitalWriteWithRes(IOE_PIN_TOUCH_RST, LOW, &touch_reset);
+        if (touch_reset == M5IOE1_OK) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            ioe_.digitalWriteWithRes(IOE_PIN_TOUCH_RST, HIGH, &touch_reset);
+            if (touch_reset == M5IOE1_OK) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                i2c_device_config_t config = {};
+                config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+                config.device_address = 0x15;
+                config.scl_speed_hz = 100000;
+                if (i2c_master_bus_add_device(i2c_bus_, &config, &touch_) != ESP_OK)
+                    ESP_LOGW(TAG, "Touch device registration failed; disabling touch");
+            }
+        }
+        if (touch_reset != M5IOE1_OK) {
+            ESP_LOGW(TAG, "Touch reset unavailable; disabling touch");
+        }
+
+        if (i2c_master_probe(i2c_bus_, BMI270_I2C_ADDRESS, 20) == ESP_OK) {
+            i2c_config_t bus_config = {};
+            bus_config.mode = I2C_MODE_MASTER;
+            bus_config.sda_io_num = AUDIO_CODEC_I2C_SDA_PIN;
+            bus_config.scl_io_num = AUDIO_CODEC_I2C_SCL_PIN;
+            bus_config.sda_pullup_en = true;
+            bus_config.scl_pullup_en = true;
+            bus_config.master.clk_speed = 100000;
+            // i2c_bus v2 attaches to the existing master bus instead of replacing it.
+            auto shared_bus = i2c_bus_create(I2C_NUM_0, &bus_config);
+            const auto result =
+                shared_bus
+                    ? bmi270_sensor_create(shared_bus, &imu_, bmi270_config_file,
+                                           BMI2_GYRO_CROSS_SENS_ENABLE | BMI2_CRT_RTOSK_ENABLE)
+                    : ESP_FAIL;
+            if (result == ESP_OK && imu_) {
+                struct bmi2_sens_config config = {};
+                config.type = BMI2_ACCEL;
+                config.cfg.acc.odr = BMI2_ACC_ODR_25HZ;
+                config.cfg.acc.range = BMI2_ACC_RANGE_4G;
+                config.cfg.acc.bwp = BMI2_ACC_NORMAL_AVG4;
+                config.cfg.acc.filter_perf = BMI2_PERF_OPT_MODE;
+                const uint8_t sensors[] = {BMI2_ACCEL};
+                if (bmi270_set_sensor_config(&config, 1, imu_) != BMI2_OK ||
+                    bmi270_sensor_enable(sensors, 1, imu_) != BMI2_OK) {
+                    ESP_LOGW(TAG, "BMI270 accelerometer configuration failed");
+                    bmi270_sensor_del(&imu_);
+                }
+            } else {
+                ESP_LOGW(TAG, "BMI270 initialization failed: %s", esp_err_to_name(result));
+                if (imu_)
+                    bmi270_sensor_del(&imu_);
+            }
+        }
+        ESP_LOGI(TAG, "Optional inputs: touch=%s, BMI270=%s",
+                 touch_ ? "polling (presence unconfirmed)" : "disabled",
+                 imu_ ? "ready" : "disabled");
+        if ((touch_ || imu_) &&
+            xTaskCreate(
+                [](void* arg) { static_cast<M5StackStopwatchGrokbotBoard*>(arg)->InputTask(); },
+                "grokbot_inputs", 4096, this, 1, nullptr) != pdPASS) {
+            ESP_LOGW(TAG, "Failed to start input polling task");
+        }
+    }
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -225,6 +393,7 @@ public:
         InitializeSpi();
         InitializeDisplay();
         InitializeButtons();
+        InitializeInputs();
     }
 
     AudioCodec* GetAudioCodec() override {

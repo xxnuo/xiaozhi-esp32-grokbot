@@ -267,6 +267,17 @@ bool GrokBotDirector::OnEmotion(const char* emotion) {
     }
     return false;
 }
+bool GrokBotDirector::OnInteraction(const char* emotion) {
+    if (status_ != StatusId::kIdle || power_save_ || notification_until_ > now_ ||
+        !OnEmotion(emotion)) {
+        return false;
+    }
+    ResetIdle(true);
+    fidget_ = nullptr;
+    transition_ = nullptr;
+    emotion_until_ = now_ + 2500;
+    return true;
+}
 void GrokBotDirector::OnUserSpeech() {
     // The wake-word transcript is echoed as a user message before the greeting.
     if (now_ < wake_echo_until_)

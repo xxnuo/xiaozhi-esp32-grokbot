@@ -732,6 +732,42 @@ void Notifications() {
     auto n5 = d.Step(15001);
     CHECK(!Is(n5, "notifying"));
 }
+void Interactions() {
+    Director d;
+    Boot(d);
+    d.Step(240000);
+    d.OnClipEvent(Event::kCycleBoundary);
+    CHECK(Is(d.Step(240000), "drowsy"));
+    d.Step(300000);
+    d.OnClipEvent(Event::kCycleBoundary);
+    CHECK(Is(d.Step(300000), "sleeping"));
+    CHECK(d.OnInteraction("curious"));
+    CHECK(!Is(d.Step(300000), "sleeping"));
+    d.OnClipEvent(Event::kOnceDone);
+    CHECK(Is(d.Step(303000), "idle"));
+    d.OnClipEvent(Event::kCycleBoundary);
+    CHECK(!Is(d.Step(303000), "drowsy"));
+    d.OnStatus(Status::kListening);
+    CHECK(!d.OnInteraction("happy"));
+    CHECK(Is(d.Step(303000), "listening"));
+    d.OnStatus(Status::kStreaming);
+    CHECK(!d.OnInteraction("confused"));
+    CHECK(Is(d.Step(303000), "streaming"));
+
+    Director newer;
+    Boot(newer);
+    CHECK(!newer.OnInteraction("unknown"));
+    newer.SetNow(100);
+    CHECK(newer.OnInteraction("curious"));
+    newer.SetNow(1000);
+    CHECK(newer.OnEmotion("angry"));
+    CHECK(Is(newer.Step(2700), "angry") || Is(newer.Step(2700), "suspicious"));
+    newer.OnNotification(5000);
+    CHECK(!newer.OnInteraction("happy"));
+    newer.Step(6000);
+    newer.OnPowerSave(true);
+    CHECK(!newer.OnInteraction("happy"));
+}
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     const std::string test = argv[1];
@@ -753,6 +789,8 @@ int main(int argc, char** argv) {
         Legacy();
     else if (test == "notifications")
         Notifications();
+    else if (test == "interactions")
+        Interactions();
     else
         CHECK(false);
 }

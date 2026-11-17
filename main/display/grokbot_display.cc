@@ -1,5 +1,6 @@
 #include "grokbot_display.h"
 
+#include "application.h"
 #include "assets.h"
 #include "assets/lang_config.h"
 #include "lvgl_theme.h"
@@ -21,8 +22,19 @@ constexpr int kRoundEdgeInset = 56;
 constexpr int kRoundStatusTop = 56;
 constexpr int kRoundChatBottom = 66;
 constexpr int kNormalFps = 30;
+constexpr int kVoiceFps = 20;
 constexpr int kPowerSaveFps = 5;
 constexpr uint32_t kPanelTeHz = 60;
+
+// Equal cycles mean every written row lands between the same two panel scans.
+constexpr int ScanCycle(int elapsed_us, int row, int period_us, int height) {
+    const int phase = elapsed_us - (row - GrokbotDisplay::kTeScanline) * period_us / height;
+    return phase >= 0 ? phase / period_us : (phase + 1) / period_us - 1;
+}
+static_assert(ScanCycle(50, 52, 16800, 466) == 0);
+static_assert(ScanCycle(16000, 414, 16800, 466) == 0);
+static_assert(ScanCycle(28000, 414, 16800, 466) == 1);
+static_assert(ScanCycle(0, 129, 16800, 466) == -1);
 
 GrokBotDirector::StatusId MapStatus(const char* status) {
     if (status == nullptr) {
@@ -185,7 +197,11 @@ void GrokbotDisplay::TeIsr(void* arg) {
     if (display->te_semaphore_ == nullptr) {
         return;
     }
-    display->te_timestamp_.store(esp_timer_get_time(), std::memory_order_relaxed);
+    const uint32_t now = esp_timer_get_time();
+    const uint32_t previous = display->te_timestamp_.exchange(now, std::memory_order_relaxed);
+    const uint32_t period = now - previous;
+    if (previous && period > 15000 && period < 18000)
+        display->te_period_us_.store(period, std::memory_order_relaxed);
     display->te_edge_count_.fetch_add(1, std::memory_order_relaxed);
     BaseType_t higher_priority_task_woken = pdFALSE;
     xSemaphoreGiveFromISR(display->te_semaphore_, &higher_priority_task_woken);
@@ -194,7 +210,30 @@ void GrokbotDisplay::TeIsr(void* arg) {
     }
 }
 
-bool GrokbotDisplay::WaitForTeFrame(int fps) {
+bool GrokbotDisplay::TransferDone(esp_lcd_panel_io_handle_t io,
+                                  esp_lcd_panel_io_event_data_t* event, void* arg) {
+    auto* self = static_cast<GrokbotDisplay*>(arg);
+    const uint32_t completed_us = esp_timer_get_time();
+    if (self->te_isr_installed_) {
+        self->CheckStripTransfer(completed_us);
+        if (self->strip_last_)
+            self->tear_risk_.fetch_add(self->refresh_tear_risk_, std::memory_order_relaxed);
+    }
+    if (self->strip_last_) {
+        const uint32_t elapsed_us =
+            completed_us - self->frame_transfer_start_us_.load(std::memory_order_relaxed);
+        self->frame_transfer_us_total_.fetch_add(elapsed_us, std::memory_order_relaxed);
+        self->frame_transfer_count_.fetch_add(1, std::memory_order_relaxed);
+        uint32_t maximum = self->frame_transfer_us_max_.load(std::memory_order_relaxed);
+        while (elapsed_us > maximum && !self->frame_transfer_us_max_.compare_exchange_weak(
+                                           maximum, elapsed_us, std::memory_order_relaxed)) {
+        }
+    }
+    lv_display_flush_ready(self->display_);
+    return false;
+}
+
+bool GrokbotDisplay::WaitForTeFrame(int fps, bool pace_animation) {
     if (!te_isr_installed_ || te_semaphore_ == nullptr) {
         return true;
     }
@@ -216,41 +255,71 @@ bool GrokbotDisplay::WaitForTeFrame(int fps) {
         }
         current_edge = te_edge_count_.load(std::memory_order_acquire);
     }
-    last_te_present_count_ = target_edge;
+    if (pace_animation)
+        last_te_present_count_ = target_edge;
     te_wait_us_total_.fetch_add(NowUs() - start_us, std::memory_order_relaxed);
     te_wait_count_.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void GrokbotDisplay::CheckStripTransfer(uint32_t completed_us) {
+    const int start = static_cast<int32_t>(strip_start_us_ - refresh_te_us_);
+    const int end = static_cast<int32_t>(completed_us - refresh_te_us_);
+    const int first = ScanCycle(start, strip_area_.y1, refresh_period_us_, height_);
+    const int last = ScanCycle(end, strip_area_.y2 + 1, refresh_period_us_, height_);
+    refresh_tear_risk_ |= first != last || first != refresh_scan_cycle_;
 }
 
 void GrokbotDisplay::RefreshEventCb(lv_event_t* event) {
     auto* self = static_cast<GrokbotDisplay*>(lv_event_get_user_data(event));
     if (lv_event_get_code(event) == LV_EVENT_REFR_START) {
         self->refreshing_frame_ = self->refresh_pending_.exchange(false);
-        self->awaiting_te_ = self->refreshing_frame_;
+        self->awaiting_te_ = true;
     } else if (lv_event_get_code(event) == LV_EVENT_FLUSH_START) {
-        if (self->awaiting_te_) {
+        const bool first_strip = self->awaiting_te_;
+        if (first_strip) {
             self->awaiting_te_ = false;
-            // Align the first DMA strip, not the asynchronous LVGL invalidation.
-            if (self->refresh_fps_ >= kNormalFps)
-                self->WaitForTeFrame(self->refresh_fps_);
-            const int64_t now = self->NowUs();
-            const int64_t previous = self->last_present_us_.exchange(now);
-            if (previous) {
-                portENTER_CRITICAL(&self->mailbox_mux_);
-                const uint32_t interval = now - previous;
-                self->te_lag_max_us_ =
-                    std::max(self->te_lag_max_us_,
-                             uint32_t(now) - self->te_timestamp_.load(std::memory_order_relaxed));
-                if (self->interval_count_ < 256)
-                    self->frame_intervals_[self->interval_count_++] = interval;
-                if (interval > 40000)
-                    ++self->slow_frames_;
-                portEXIT_CRITICAL(&self->mailbox_mux_);
+            // Every flush waits under the LVGL lock; low-fps pacing happened before submission.
+            const int sync_fps = self->refreshing_frame_ && self->refresh_fps_ >= kNormalFps
+                                     ? self->refresh_fps_
+                                     : kPanelTeHz;
+            self->WaitForTeFrame(sync_fps, self->refreshing_frame_);
+            if (self->refreshing_frame_) {
+                const int64_t now = self->NowUs();
+                const int64_t previous = self->last_present_us_.exchange(now);
+                if (previous) {
+                    portENTER_CRITICAL(&self->mailbox_mux_);
+                    const uint32_t interval = now - previous;
+                    self->te_lag_max_us_ = std::max(
+                        self->te_lag_max_us_,
+                        uint32_t(now) - self->te_timestamp_.load(std::memory_order_relaxed));
+                    if (self->interval_count_ < 256)
+                        self->frame_intervals_[self->interval_count_++] = interval;
+                    if (interval > 40000)
+                        ++self->slow_frames_;
+                    portEXIT_CRITICAL(&self->mailbox_mux_);
+                }
             }
         }
-    } else if (self->refreshing_frame_) {
-        self->refreshing_frame_ = false;
-        xSemaphoreGive(self->refresh_ready_);
+        const auto* area = static_cast<lv_area_t*>(lv_event_get_param(event));
+        const uint32_t now = self->NowUs();
+        if (first_strip) {
+            self->frame_transfer_start_us_.store(now, std::memory_order_relaxed);
+            self->refresh_tear_risk_ = false;
+            self->refresh_te_us_ = self->te_timestamp_.load();
+            self->refresh_period_us_ = self->te_period_us_.load();
+            self->refresh_scan_cycle_ =
+                ScanCycle(static_cast<int32_t>(now - self->refresh_te_us_), area->y1,
+                          self->refresh_period_us_, self->height_);
+        }
+        self->strip_area_ = *area;
+        self->strip_start_us_ = now;
+        self->strip_last_ = lv_display_flush_is_last(self->display_);
+    } else if (lv_event_get_code(event) == LV_EVENT_REFR_READY) {
+        if (self->refreshing_frame_) {
+            self->refreshing_frame_ = false;
+            xSemaphoreGive(self->refresh_ready_);
+        }
     }
 }
 
@@ -294,6 +363,9 @@ void GrokbotDisplay::SetupUI() {
 
     lv_display_add_event_cb(display_, RounderEventCb, LV_EVENT_INVALIDATE_AREA, nullptr);
     InitializeTe();
+    esp_lcd_panel_io_callbacks_t callbacks = {};
+    callbacks.on_color_trans_done = TransferDone;
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(panel_io_, &callbacks, this));
     refresh_ready_ = xSemaphoreCreateBinary();
     if (!refresh_ready_) {
         ESP_LOGE(TAG, "Failed to create refresh semaphore");
@@ -331,6 +403,15 @@ bool GrokbotDisplay::SetEmotion(const char* emotion) {
     return accepted;
 }
 
+bool GrokbotDisplay::OnInteraction(const char* emotion) {
+    const int64_t now_ms = NowUs() / 1000;
+    portENTER_CRITICAL(&mailbox_mux_);
+    director_.SetNow(now_ms);
+    const bool accepted = director_.OnInteraction(emotion);
+    portEXIT_CRITICAL(&mailbox_mux_);
+    return accepted;
+}
+
 void GrokbotDisplay::SetStatus(const char* status) {
     const auto mapped = MapStatus(status);
     const bool loading_assets = status && strcmp(status, Lang::Strings::LOADING_ASSETS) == 0;
@@ -343,9 +424,6 @@ void GrokbotDisplay::SetStatus(const char* status) {
     assets_update_in_progress_ = loading_assets;
     portEXIT_CRITICAL(&mailbox_mux_);
     LvglDisplay::SetStatus(status);
-    // Startup runs at priority 1; raise decoding only after the application enters standby.
-    if (task_handle_ && status && strcmp(status, Lang::Strings::STANDBY) == 0)
-        vTaskPrioritySet(task_handle_, 5);
 }
 
 void GrokbotDisplay::SetChatMessage(const char* role, const char* content) {
@@ -428,6 +506,8 @@ bool GrokbotDisplay::EnsurePlayer() {
         has_selected_ = false;
         heap_caps_free(start_frames_);
         start_frames_ = nullptr;
+        face_ = GrokBotFace(static_cast<uint32_t>(now));
+        face_exit_until_ = 0;
         if (!player_.init(data, size)) {
             return false;
         }
@@ -650,9 +730,13 @@ bool GrokbotDisplay::PresentFrame() {
     if (xSemaphoreTake(refresh_ready_, pdMS_TO_TICKS(1000)) != pdTRUE)
         return false;
     const int fps = std::max(1, target_fps_.load());
-    // A sleeping frame must not hold the LVGL lock while waiting 200ms.
-    if (fps < kNormalFps)
-        WaitForTeFrame(fps);
+    // Leave only the final TE edge for the flush callback to wait on under the LVGL lock.
+    if (te_isr_installed_ && fps < kNormalFps) {
+        const int64_t wait_us =
+            last_present_us_.load() + 1000000LL / fps - 1000000LL / kPanelTeHz - NowUs();
+        if (wait_us > 0)
+            vTaskDelay(pdMS_TO_TICKS((wait_us + 999) / 1000));
+    }
     {
         DisplayLockGuard lock(this);
         if (!lock) {
@@ -682,9 +766,16 @@ bool GrokbotDisplay::PresentFrame() {
 }
 
 bool GrokbotDisplay::CacheStartFrames() {
-    if (packed_size_ > SIZE_MAX / static_cast<size_t>(player_.clip_count()))
+    int cached_clips = 0;
+    for (int clip = 0; clip < player_.clip_count(); ++clip) {
+        start_frame_slots_[clip] =
+            GrokBotFace::Supports(player_.clip_name(clip)) ? -1 : cached_clips++;
+    }
+    if (cached_clips == 0)
+        return true;
+    if (packed_size_ > SIZE_MAX / static_cast<size_t>(cached_clips))
         return false;
-    const size_t cache_size = packed_size_ * player_.clip_count();
+    const size_t cache_size = packed_size_ * cached_clips;
     start_frames_ = static_cast<uint8_t*>(
         heap_caps_aligned_alloc(64, cache_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!start_frames_) {
@@ -693,6 +784,8 @@ bool GrokbotDisplay::CacheStartFrames() {
     }
     const int64_t began = NowUs();
     for (int clip = 0; clip < player_.clip_count(); ++clip) {
+        if (start_frame_slots_[clip] < 0)
+            continue;
         player_.select(clip);
         const int target = player_.start_frame();
         GrokBotPlayer::FrameInfo frame;
@@ -708,23 +801,24 @@ bool GrokbotDisplay::CacheStartFrames() {
             if (!player_.frame_info(index, &frame) || (index == key && frame.delta) ||
                 !DecodeFrame(frame, false))
                 return false;
-        memcpy(start_frames_ + clip * packed_size_, packed_, packed_size_);
+        memcpy(start_frames_ + start_frame_slots_[clip] * packed_size_, packed_, packed_size_);
         // Startup cache work must give audio and board initialization time to run.
         vTaskDelay(1);
     }
     player_.select(0);
     packed_index_ = -1;
     decode_us_total_ = 0;
-    ESP_LOGI(TAG, "Cached %d start frames: %u bytes PSRAM in %lldms; remaining=%u",
-             player_.clip_count(), static_cast<unsigned>(cache_size), (NowUs() - began) / 1000,
+    ESP_LOGI(TAG, "Cached %d start frames: %u bytes PSRAM in %lldms; remaining=%u", cached_clips,
+             static_cast<unsigned>(cache_size), (NowUs() - began) / 1000,
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     return true;
 }
 
 bool GrokbotDisplay::RebuildCurrentFrame() {
     const int target = player_.current_index();
-    const uint8_t* cached = GrokBotCachedStart(start_frames_, player_.selected_index(), target,
-                                               player_.start_frame(), packed_size_);
+    const uint8_t* cached =
+        GrokBotCachedStart(start_frames_, start_frame_slots_[player_.selected_index()], target,
+                           player_.start_frame(), packed_size_);
     if (cached) {
         memcpy(packed_, cached, packed_size_);
         packed_index_ = target;
@@ -780,7 +874,15 @@ void GrokbotDisplay::AnimationTask() {
     GrokBotDirector::ClipEvent pending_event = GrokBotDirector::ClipEvent::kCycleBoundary;
     bool event_pending = false;
     bool once_done = false;
+    UBaseType_t animation_priority = 1;
     while (running_.load()) {
+        // AFE and Opus must preempt animation during a voice session.
+        const auto device_state = Application::GetInstance().GetDeviceState();
+        const UBaseType_t priority = device_state == kDeviceStateIdle ? 5 : 1;
+        if (priority != animation_priority) {
+            animation_priority = priority;
+            vTaskPrioritySet(nullptr, priority);
+        }
         portENTER_CRITICAL(&mailbox_mux_);
         bool paused = assets_update_in_progress_;
         portEXIT_CRITICAL(&mailbox_mux_);
@@ -815,11 +917,26 @@ void GrokbotDisplay::AnimationTask() {
                 vTaskDelay(pdMS_TO_TICKS(250));
                 continue;
             }
-            if (have_displayed_frame_) {
+            const bool previous_geometry =
+                GrokBotFace::Supports(directive.clip) || face_exit_until_ > now_ms;
+            const bool bridge_to_icon = have_displayed_frame_ && previous_geometry &&
+                                        GrokBotFace::AtlasBridgeSupported(next.clip);
+            face_exit_until_ = 0;
+            if (have_displayed_frame_ && !bridge_to_icon &&
+                !(previous_geometry && GrokBotFace::Supports(next.clip))) {
                 memcpy(fade_from_, displayed_packed_, packed_size_);
                 fade_step_ = 0;
+            } else {
+                fade_step_ = kGrokBotFadeFrames;
             }
             directive = next;
+            if (bridge_to_icon) {
+                face_.BeginAtlasBridge(now_ms);
+                face_exit_until_ = now_ms + 350;
+                directive.from_frame_zero = true;
+            } else {
+                face_.Select(next.clip, next.seq, now_ms);
+            }
             const int upper =
                 GrokBotFrameUpper(player_.selected_frame_count(), directive.max_frames);
             player_.seek(
@@ -831,10 +948,13 @@ void GrokbotDisplay::AnimationTask() {
             once_done = false;
             clip_changed = true;
         }
-        const int fps = power_save && strcmp(directive.clip, "sleeping") == 0 &&
-                                fade_step_ >= kGrokBotFadeFrames
-                            ? kPowerSaveFps
-                            : kNormalFps;
+        const int fps =
+            power_save && strcmp(directive.clip, "sleeping") == 0 &&
+                    fade_step_ >= kGrokBotFadeFrames
+                ? kPowerSaveFps
+            : (device_state == kDeviceStateListening || device_state == kDeviceStateSpeaking)
+                ? kVoiceFps
+                : kNormalFps;
         target_fps_.store(fps);
         const int64_t frame_us = 1000000LL / fps;
         if (once_done) {
@@ -851,42 +971,67 @@ void GrokbotDisplay::AnimationTask() {
         if (action != GrokBotFrameAction::kPresent && !source_valid)
             action = GrokBotFrameAction::kRebuild;
         bool rendered = false;
-        switch (action) {
-            case GrokBotFrameAction::kPresent:
-                ExpandPackedFrame();
+        const bool face_exiting = now_ms < face_exit_until_;
+        if (GrokBotFace::Supports(directive.clip) || face_exiting) {
+            const int64_t face_start = NowUs();
+            const bool fused = fade_step_ >= kGrokBotFadeFrames;
+            // Write the candidate snapshot directly; PresentFrame commits it only on success.
+            const bool prepared =
+                fused ? face_.Render(
+                            delta_, frame_width_, frame_height_, now_ms, packed_, packed_size_,
+                            reinterpret_cast<uint32_t*>(image_buffers_[pipeline_.write]), pair_lut_)
+                      : face_.Render(packed_, frame_width_, frame_height_, now_ms, delta_,
+                                     packed_size_);
+            if (prepared) {
+                const uint32_t face_us = NowUs() - face_start;
+                face_us_total_ += face_us;
+                face_us_max_ = std::max(face_us_max_, face_us);
+                ++face_frame_count_;
+                packed_index_ = -1;
+                if (!fused)
+                    ExpandPackedFrame();
                 rendered = PresentFrame();
-                break;
-            case GrokBotFrameAction::kDecode:
-                if (DecodeFrame(frame, true)) {
-                    packed_index_ = target;
+            }
+        } else
+            switch (action) {
+                case GrokBotFrameAction::kPresent:
+                    ExpandPackedFrame();
                     rendered = PresentFrame();
-                }
-                break;
-            case GrokBotFrameAction::kRebuild:
-                rendered = RebuildCurrentFrame();
-                break;
-        }
+                    break;
+                case GrokBotFrameAction::kDecode:
+                    if (DecodeFrame(frame, true)) {
+                        packed_index_ = target;
+                        rendered = PresentFrame();
+                    }
+                    break;
+                case GrokBotFrameAction::kRebuild:
+                    rendered = RebuildCurrentFrame();
+                    break;
+            }
         if (!rendered) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
         if (clip_changed)
             ESP_LOGI(TAG, "Animation -> %s", directive.clip);
-        const int upper = GrokBotFrameUpper(player_.selected_frame_count(), directive.max_frames);
-        const int lower =
-            GrokBotFrameLower(player_.start_frame(), upper, directive.from_frame_zero);
-        const auto step =
-            GrokBotNextFrame(target, reverse_, lower, upper,
-                             directive.mode == GrokBotDirector::PlayMode::kLoopPingPong,
-                             directive.mode == GrokBotDirector::PlayMode::kOnceForward);
-        if (step.cycle_boundary || step.once_done) {
-            pending_event = step.once_done ? GrokBotDirector::ClipEvent::kOnceDone
-                                           : GrokBotDirector::ClipEvent::kCycleBoundary;
-            event_pending = true;
+        if (!face_exiting) {
+            const int upper =
+                GrokBotFrameUpper(player_.selected_frame_count(), directive.max_frames);
+            const int lower =
+                GrokBotFrameLower(player_.start_frame(), upper, directive.from_frame_zero);
+            const auto step =
+                GrokBotNextFrame(target, reverse_, lower, upper,
+                                 directive.mode == GrokBotDirector::PlayMode::kLoopPingPong,
+                                 directive.mode == GrokBotDirector::PlayMode::kOnceForward);
+            if (step.cycle_boundary || step.once_done) {
+                pending_event = step.once_done ? GrokBotDirector::ClipEvent::kOnceDone
+                                               : GrokBotDirector::ClipEvent::kCycleBoundary;
+                event_pending = true;
+            }
+            once_done = step.once_done;
+            reverse_ = step.reverse;
+            player_.seek(step.index);
         }
-        once_done = step.once_done;
-        reverse_ = step.reverse;
-        player_.seek(step.index);
         render_total_us += NowUs() - render_start_us;
         ++rendered_frames;
 
@@ -930,6 +1075,7 @@ void GrokbotDisplay::AnimationTask() {
             const unsigned count = interval_count_;
             const unsigned slow = slow_frames_;
             const uint32_t lag_max = te_lag_max_us_;
+            const unsigned tear_risk = tear_risk_.exchange(0, std::memory_order_relaxed);
             te_lag_max_us_ = 0;
             memcpy(intervals, frame_intervals_, count * sizeof(uint32_t));
             interval_count_ = 0;
@@ -939,20 +1085,32 @@ void GrokbotDisplay::AnimationTask() {
             const uint32_t p50 = count ? intervals[(count - 1) * 50 / 100] : 0;
             const uint32_t p95 = count ? intervals[(count - 1) * 95 / 100] : 0;
             const uint32_t maximum = count ? intervals[count - 1] : 0;
-            ESP_LOGI(TAG,
-                     "Animation fps=%u.%02u render=%uus decode=%uus present=%uus "
-                     "te_wait=%uus te_hz=%u te_timeout=%u interval_p50=%uus interval_p95=%uus "
-                     "interval_max=%uus over40ms=%u te_lag_max=%uus state=%s",
-                     fps_hundredths / 100, fps_hundredths % 100,
-                     static_cast<unsigned>(avg_render_us), static_cast<unsigned>(avg_decode_us),
-                     static_cast<unsigned>(avg_present_us), static_cast<unsigned>(avg_te_wait_us),
-                     static_cast<unsigned>(
-                         (static_cast<uint64_t>(te_edges) * 1000000 + elapsed_us / 2) / elapsed_us),
-                     static_cast<unsigned>(te_timeouts), p50, p95, maximum, slow, lag_max,
-                     player_.selected_name());
+            const uint32_t transfer_total = frame_transfer_us_total_.exchange(0);
+            const uint32_t transfer_count = frame_transfer_count_.exchange(0);
+            const uint32_t transfer_max = frame_transfer_us_max_.exchange(0);
+            ESP_LOGI(
+                TAG,
+                "Animation fps=%u.%02u render=%uus decode=%uus present=%uus "
+                "geometry=%uus geometry_max=%uus stack_hwm=%u "
+                "transfer=%uus transfer_max=%uus "
+                "te_wait=%uus te_hz=%u te_timeout=%u interval_p50=%uus interval_p95=%uus "
+                "interval_max=%uus over40ms=%u te_lag_max=%uus tear_risk=%u state=%s",
+                fps_hundredths / 100, fps_hundredths % 100, static_cast<unsigned>(avg_render_us),
+                static_cast<unsigned>(avg_decode_us), static_cast<unsigned>(avg_present_us),
+                static_cast<unsigned>(face_frame_count_ ? face_us_total_ / face_frame_count_ : 0),
+                face_us_max_, static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
+                static_cast<unsigned>(transfer_count ? transfer_total / transfer_count : 0),
+                static_cast<unsigned>(transfer_max), static_cast<unsigned>(avg_te_wait_us),
+                static_cast<unsigned>((static_cast<uint64_t>(te_edges) * 1000000 + elapsed_us / 2) /
+                                      elapsed_us),
+                static_cast<unsigned>(te_timeouts), p50, p95, maximum, slow, lag_max, tear_risk,
+                player_.selected_name());
             report_start_us = now;
             render_total_us = 0;
             decode_us_total_ = 0;
+            face_us_total_ = 0;
+            face_us_max_ = 0;
+            face_frame_count_ = 0;
             present_us_total_ = 0;
             rendered_frames = 0;
         }

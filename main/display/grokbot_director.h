@@ -40,6 +40,7 @@ public:
     }
     void OnStatus(StatusId status);
     bool OnEmotion(const char* emotion);
+    bool OnInteraction(const char* emotion);
     void OnUserSpeech();
     void OnNotification(int64_t until_ms, const char* clip = "notifying");
     void OnPowerSave(bool on);

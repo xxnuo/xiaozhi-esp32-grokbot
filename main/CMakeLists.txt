@@ -249,7 +249,7 @@ elseif(CONFIG_BOARD_TYPE_M5STACK_STOPWATCH_GROKBOT)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/boards/m5stack/stopwatch-grokbot/assets")
-    list(APPEND SOURCES "display/grokbot_display.cc" "display/grokbot_player.cc" "display/grokbot_director.cc")
+    list(APPEND SOURCES "display/grokbot_display.cc" "display/grokbot_player.cc" "display/grokbot_director.cc" "display/grokbot_face.cc")
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_rom)
 elseif(CONFIG_BOARD_TYPE_M5STACK_CORE_P4)
     set(BOARD_DIR "m5stack/corep4")
@@ -1182,7 +1182,8 @@ if(BOARD_TYPE STREQUAL "m5stack-stick-s3")
         m5stack__m5pm1
     )
 endif()
-if(CONFIG_BOARD_TYPE_ESP_SPOT_S3 OR CONFIG_BOARD_TYPE_ESP_SPOT_C5 OR CONFIG_BOARD_TYPE_ESP_VOCAT)
+if(CONFIG_BOARD_TYPE_ESP_SPOT_S3 OR CONFIG_BOARD_TYPE_ESP_SPOT_C5 OR CONFIG_BOARD_TYPE_ESP_VOCAT
+   OR CONFIG_BOARD_TYPE_M5STACK_STOPWATCH_GROKBOT)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA
         espressif__bmi270_sensor
     )

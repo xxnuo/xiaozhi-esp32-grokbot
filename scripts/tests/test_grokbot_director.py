@@ -53,6 +53,9 @@ class GrokBotDirectorTests(unittest.TestCase):
     def test_notifications_expiry_and_priority(self):
         self.run_case("notifications")
 
+    def test_local_interactions_wake_idle_without_interrupting_business(self):
+        self.run_case("interactions")
+
 
 if __name__ == "__main__":
     unittest.main()

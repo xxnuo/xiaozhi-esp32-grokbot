@@ -6,8 +6,10 @@ animation rendered through the normal LVGL display pipeline.
 
 ## Runtime design
 
-- 360x360, 4-bit grayscale, 30 FPS GrokBot clips.
-- Only the 39 GrokBot clips used by Xiaozhi are packaged (~5.04 MiB). Byte-identical
+- 360x360, 4-bit grayscale: idle targets 30 FPS, voice sessions 20 FPS, and
+  power-save sleep 5 FPS. Ordinary sphere faces are rendered
+  from eye geometry and motion tracks; complex icon animations use the atlas.
+- The 39 GrokBot clips used by Xiaozhi are packaged (~4.85 MiB). Byte-identical
   showcase duplicates (`bored`, `blocked`, `orbit`, `progress`, `dragging`,
   `showcase`, `reading`, `coding`, `running`, `computing`, `controlling`) and thin-line
   morphs (`bouncing`, `dictating`, `sending`) from the 53-state showcase atlas are excluded.
@@ -18,6 +20,19 @@ animation rendered through the normal LVGL display pipeline.
   64-line DMA buffer rather than reading a full PSRAM frame directly.
 - Animation decoding runs in a separate low-priority task on core 0. Audio and
   the application event loop are not blocked by frame decoding.
+- Eye shapes interpolate over 280ms and body poses over 350ms. Interrupted
+  transitions resume from the current geometry. Idle uses breathing, gaze,
+  blinks and the Idle_B/Idle_D/Idle_A motion tracks.
+- Face-to-icon transitions with a known shared starting pose first return to
+  that pose geometrically. Other atlas transitions retain a six-frame blend.
+- CO5300 vertical TE at scanline 128 aligns strip transfers. Status refreshes
+  share the same serialized TE wait; low-rate sleep pacing stays outside the
+  LVGL lock. The diagnostic `tear_risk` estimates scan timing and is not an
+  optical measurement.
+- Voice-session pacing leaves time for AFE and Opus; animation runs below them
+  in priority outside idle. Atlas frame-count-based segments take 1.5 times
+  their 30 FPS duration during voice sessions, including the waking sequence;
+  geometric eye/body transitions keep their 280/350ms durations.
 
 ## State mapping & director behavior
 
@@ -88,6 +103,14 @@ Additional clips and mappings in the 39-clip subset:
 
 Button 1 keeps the normal wake/chat behavior and Button 2 keeps the normal
 volume behavior. No GrokBot showcase controls are assigned to them.
+
+The optional CST820B touchscreen and BMI270 accelerometer are polled at 20 Hz.
+While idle, a tap produces a happy reaction, a stroke an affectionate reaction,
+a shake a confused reaction, and a sustained tilt a curious reaction. These
+interactions restart the idle timer and wake a visually sleeping face. They do
+not start a voice session or interrupt listening, speaking, notifications, or
+power-save mode. Reactions share a 1.8-second cooldown; stale queued input is
+dropped. Missing sensors do not prevent startup.
 
 ## Build
 
