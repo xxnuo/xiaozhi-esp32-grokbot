@@ -103,7 +103,9 @@ GrokbotDisplay::GrokbotDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
     : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy,
                     80),
       director_(static_cast<uint32_t>(esp_timer_get_time())),
-      te_pin_(te_pin) {}
+      te_pin_(te_pin) {
+    show_idle_clock_ = false;
+}
 
 GrokbotDisplay::~GrokbotDisplay() {
     running_.store(false);

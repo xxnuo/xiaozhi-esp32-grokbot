@@ -215,7 +215,7 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
 
     // Update time — show HH:MM when idle; refresh immediately on state
     // transitions (update_all=true) and on every minute change thereafter.
-    if (app.GetDeviceState() == kDeviceStateIdle) {
+    if (show_idle_clock_ && app.GetDeviceState() == kDeviceStateIdle) {
         time_t now = time(NULL);
         struct tm* tm_now = localtime(&now);
         if (tm_now->tm_year >= 2025 - 1900) {
