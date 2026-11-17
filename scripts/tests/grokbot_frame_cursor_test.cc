@@ -102,6 +102,20 @@ void MiddleKeyFrame() {
 }
 
 void FrameLimit() {
+    CHECK(GrokBotFrameLower(2, 30, true) == 0);
+    const auto intro_done = GrokBotNextFrame(0, true, 0, 30, false, false);
+    CHECK(intro_done.once_done && !intro_done.cycle_boundary);
+    int intro_target = 0;
+    bool intro_reverse = false;
+    int intro_frames = 0;
+    GrokBotFrameStep intro_step{};
+    do {
+        intro_step = GrokBotNextFrame(intro_target, intro_reverse, 0, 30, false, false);
+        intro_target = intro_step.index;
+        intro_reverse = intro_step.reverse;
+        ++intro_frames;
+    } while (!intro_step.once_done && intro_frames <= 61);
+    CHECK(intro_step.once_done && intro_target == 1 && intro_frames == 61);
     CHECK(GrokBotFrameUpper(3, 10) == 2);
     const int upper = GrokBotFrameUpper(3, 2);
     const int lower = GrokBotFrameLower(2, upper);

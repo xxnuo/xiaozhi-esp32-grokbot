@@ -1,4 +1,5 @@
 #include "grokbot_director.h"
+#include "grokbot_player.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -26,10 +27,10 @@ void Boot(Director& d) {
     CHECK(Is(pre, "loading") && pre.mode == Mode::kLoopPingPong);
     d.OnStatus(Status::kIdle);
     auto first = d.Step(0);
-    CHECK(Is(first, "spawning") && first.max_frames == 75 && first.mode == Mode::kOnceForward);
+    CHECK(Is(first, "logo") && first.max_frames == 57 && first.mode == Mode::kOncePingPong);
     d.OnClipEvent(Event::kOnceDone);
     auto idle = d.Step(0);
-    CHECK(Is(idle, "idle"));
+    CHECK(Is(idle, "idle") && idle.max_frames == 0);
 }
 void Stages() {
     Director d;
@@ -79,6 +80,7 @@ void Stages() {
     auto after_boundary = f.Step(220500);
     CHECK(Is(after_boundary, "drowsy"));
 }
+void IdleBreathing();
 void Fidgets() {
     Director a(123), b(123);
     Boot(a);
@@ -102,8 +104,10 @@ void Fidgets() {
         CHECK(!recent[1] || std::strcmp(first.clip, recent[1]) != 0);
         if (Is(first, "suspicious") || Is(first, "shy"))
             CHECK(first.max_frames == 90);
-        if (Is(first, "proud") || Is(first, "logo"))
+        if (Is(first, "proud"))
             CHECK(first.max_frames == 75);
+        if (Is(first, "logo"))
+            CHECK(first.max_frames == 57);
         recent[1] = recent[0];
         recent[0] = first.clip;
         ++count;
@@ -115,6 +119,31 @@ void Fidgets() {
         CHECK(Is(next_b, "idle"));
     }
     CHECK(count >= 5);
+    IdleBreathing();
+    bool saw_late_shy = false;
+    for (uint32_t seed = 1; seed <= 10; ++seed) {
+        Director late(seed);
+        Boot(late);
+        int64_t last_done = -1;
+        for (int64_t t = 100000; t <= 180000; t += 400) {
+            late.Step(t);
+            late.OnClipEvent(Event::kCycleBoundary);
+            const auto clip = late.Step(t);
+            if (Is(clip, "idle"))
+                continue;
+            CHECK(Is(clip, "drowsy") || Is(clip, "humming") || Is(clip, "shy"));
+            if (last_done >= 0)
+                CHECK(t - last_done >= 8000 && t - last_done <= 15400);
+            if (Is(clip, "shy")) {
+                CHECK(clip.max_frames == 90);
+                saw_late_shy = true;
+            }
+            late.OnClipEvent(Event::kOnceDone);
+            late.Step(t);
+            last_done = t;
+        }
+    }
+    CHECK(saw_late_shy);
     Director early(7);
     Boot(early);
     early.OnUserSpeech();
@@ -129,6 +158,55 @@ void Fidgets() {
         }
     }
     CHECK(false);
+}
+void IdleBreathing() {
+    bool saw_pause = false, saw_varied_pause = false;
+    int first_pause_frames = 0;
+    for (uint32_t seed = 1; seed <= 20; ++seed) {
+        Director d(seed);
+        const char* available[] = {"idle"};
+        d.SetAvailable(available, 1);
+        d.OnStatus(Status::kIdle);
+        Director::Directive current{nullptr, Mode::kLoopPingPong, 0, 0};
+        int index = 2, breath_frames = 0, pause_frames = 0, pause_length = 0;
+        bool reverse = false, pending = false;
+        for (int frame = 0; frame < 6000; ++frame) {
+            d.SetNow(frame * 1000LL / 30);
+            if (pending)
+                d.OnClipEvent(Event::kCycleBoundary);
+            const auto next = d.Step(frame * 1000LL / 30);
+            CHECK(Is(next, "idle"));
+            if (next.seq != current.seq) {
+                if (current.clip)
+                    CHECK(pending);  // Both pause entry and exit must wait for a seam.
+                if (current.max_frames == 15) {
+                    CHECK(pause_length >= 13 && pause_length <= 85);
+                    if (!first_pause_frames)
+                        first_pause_frames = pause_length;
+                    else if (pause_length != first_pause_frames)
+                        saw_varied_pause = true;
+                    pause_length = 0;
+                }
+                current = next;
+                index = 2;
+                reverse = false;
+            }
+            if (current.max_frames == 15) {
+                saw_pause = true;
+                ++pause_frames;
+                ++pause_length;
+            } else {
+                ++breath_frames;
+            }
+            const auto step = GrokBotNextFrame(
+                index, reverse, 2, GrokBotFrameUpper(180, current.max_frames), true, false);
+            index = step.index;
+            reverse = step.reverse;
+            pending = step.cycle_boundary;
+        }
+        CHECK(breath_frames * 100 >= (breath_frames + pause_frames) * 70);
+    }
+    CHECK(saw_pause && saw_varied_pause);
 }
 void RareCooldowns() {
     int seen[3] = {};
@@ -166,16 +244,22 @@ void Thinking() {
     auto s0 = d.Step(0);
     CHECK(Is(s0, "listening"));
     d.OnUserSpeech();
-    auto s1 = d.Step(2499);
-    CHECK(Is(s1, "thinking"));
-    auto s2 = d.Step(2500);
-    CHECK(Is(s2, "working"));
-    d.SetNow(6500);
-    d.OnClipEvent(Event::kCycleBoundary);  // The end of working must enter searching first.
-    auto s3 = d.Step(6500);
-    CHECK(Is(s3, "searching"));
+    auto s1 = d.Step(0);
+    CHECK(Is(s1, "thinking") && s1.max_frames == 31 && s1.from_frame_zero &&
+          s1.mode == Mode::kOncePingPong);
+    d.OnClipEvent(Event::kCycleBoundary);
+    CHECK(Is(d.Step(1999), "thinking"));
+    CHECK(Is(d.Step(2000), "thinking"));  // A deadline alone cannot cut an active clip.
+    d.OnClipEvent(Event::kOnceDone);
+    auto s2 = d.Step(2033);
+    CHECK(Is(s2, "working") && s2.max_frames == 31 && s2.from_frame_zero &&
+          s2.mode == Mode::kOncePingPong);
+    CHECK(Is(d.Step(4000), "working"));
+    d.OnClipEvent(Event::kOnceDone);
+    auto s3 = d.Step(4066);
+    CHECK(Is(s3, "searching") && s3.max_frames == 0 && s3.from_frame_zero);
     for (const char* name : {"writing", "working", "searching"}) {
-        d.OnClipEvent(Event::kCycleBoundary);
+        d.OnClipEvent(Event::kOnceDone);
         auto cur = d.Step(6600);
         CHECK(Is(cur, name));
     }
@@ -279,6 +363,11 @@ void Emotions() {
     d.OnClipEvent(Event::kOnceDone);
     d.Step(71700);
 
+    for (int i = 0; i < 12; ++i) {
+        d.SetNow(72000 + i * 100);
+        ok = d.OnEmotion("low_battery");
+        CHECK(ok && Is(d.Step(72000 + i * 100), "drowsy"));
+    }
     // B1: sleeping/shy/proud/notifying time out after 8s in idle; warning is system emotion.
     d.SetNow(80000);
     ok = d.OnEmotion("sleeping");
@@ -313,7 +402,8 @@ void Transitions() {
     d.Step(0);
     d.OnStatus(Status::kIdle);
     auto finished = d.Step(0);
-    CHECK(Is(finished, "finished") && finished.mode == Mode::kOnceForward);
+    CHECK(Is(finished, "finished") && finished.mode == Mode::kOnceForward &&
+          finished.max_frames == 30);
     d.OnClipEvent(Event::kOnceDone);
     auto s0 = d.Step(0);
     CHECK(Is(s0, "idle"));
@@ -375,7 +465,7 @@ void Wake() {
     d.Step(220000);
     d.OnStatus(Status::kListening);
     auto wake = d.Step(220000);
-    CHECK(Is(wake, "waking") && wake.max_frames == 30);
+    CHECK(Is(wake, "waking") && wake.max_frames == 73);
     d.OnUserSpeech();
     auto th = d.Step(220000);
     CHECK(Is(th, "thinking"));
@@ -383,13 +473,13 @@ void Wake() {
     d.Step(220000);
     d.OnPowerSave(true);
     auto down = d.Step(220000);
-    CHECK(Is(down, "powering-down") && down.max_frames == 60);
+    CHECK(Is(down, "drowsy") && down.max_frames == 42 && down.mode == Mode::kOncePingPong);
     d.OnClipEvent(Event::kOnceDone);
     auto sl = d.Step(220000);
     CHECK(Is(sl, "sleeping"));
     d.OnPowerSave(false);
     wake = d.Step(220000);
-    CHECK(Is(wake, "waking") && wake.max_frames == 48);
+    CHECK(Is(wake, "waking") && wake.max_frames == 73);
     d.OnClipEvent(Event::kOnceDone);
     auto id1 = d.Step(220000);
     CHECK(Is(id1, "idle"));
@@ -401,10 +491,10 @@ void Wake() {
     d.Step(220000);
     d.OnStatus(Status::kLoading);
     auto w_load = d.Step(220000);
-    CHECK(Is(w_load, "waking") && w_load.max_frames == 30);
+    CHECK(Is(w_load, "waking") && w_load.max_frames == 73);
     d.OnStatus(Status::kListening);
     auto w_listen = d.Step(220000);
-    CHECK(Is(w_listen, "waking") && w_listen.max_frames == 30 && w_listen.seq == w_load.seq);
+    CHECK(Is(w_listen, "waking") && w_listen.max_frames == 73 && w_listen.seq == w_load.seq);
     d.OnClipEvent(Event::kOnceDone);
     auto after_w = d.Step(220000);
     CHECK(Is(after_w, "listening"));
@@ -445,7 +535,7 @@ void Legacy() {
     Director refreshing;
     refreshing.OnStatus(Status::kIdle);
     auto sp = refreshing.Step(0);
-    CHECK(Is(sp, "spawning"));
+    CHECK(Is(sp, "logo"));
     const uint64_t mask = Director::AvailabilityMask(old, 28);
     refreshing.SetAvailable(mask);
     auto refreshed = refreshing.Step(0);
@@ -471,6 +561,11 @@ void Legacy() {
     d.OnUserSpeech();
     auto th = d.Step(302000);
     CHECK(Is(th, "thinking"));
+    d.OnClipEvent(Event::kOnceDone);
+    auto work_fallback = d.Step(304033);
+    CHECK(Is(work_fallback, "thinking") && work_fallback.seq != th.seq);
+    d.OnClipEvent(Event::kOnceDone);
+    CHECK(Is(d.Step(306066), "searching"));
     d.OnStatus(Status::kIdle);
     bool ok = d.OnEmotion("download");
     CHECK(ok);
@@ -484,12 +579,13 @@ void Legacy() {
     CHECK(none.clip == nullptr);
 }
 void Notifications() {
-    // B3: Boot notification does not preempt spawning, and OnceDone clears notification_until_.
+    // B3: Boot notification does not preempt the boot logo, and OnceDone clears
+    // notification_until_.
     Director boot_d;
     boot_d.OnNotification(5000);
     boot_d.OnStatus(Status::kIdle);
     auto sp = boot_d.Step(0);
-    CHECK(Is(sp, "spawning"));
+    CHECK(Is(sp, "logo"));
     boot_d.OnClipEvent(Event::kOnceDone);
     auto nt = boot_d.Step(1000);
     CHECK(Is(nt, "notifying") && nt.mode == Mode::kOnceForward);

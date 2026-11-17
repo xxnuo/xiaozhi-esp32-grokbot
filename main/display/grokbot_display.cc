@@ -607,7 +607,8 @@ void GrokbotDisplay::AnimationTask() {
             directive = next;
             const int upper =
                 GrokBotFrameUpper(player_.selected_frame_count(), directive.max_frames);
-            player_.seek(GrokBotFrameLower(player_.start_frame(), upper));
+            player_.seek(
+                GrokBotFrameLower(player_.start_frame(), upper, directive.from_frame_zero));
             reverse_ = false;
             has_selected_ = true;
             packed_index_ = -1;
@@ -652,7 +653,8 @@ void GrokbotDisplay::AnimationTask() {
             continue;
         }
         const int upper = GrokBotFrameUpper(player_.selected_frame_count(), directive.max_frames);
-        const int lower = GrokBotFrameLower(player_.start_frame(), upper);
+        const int lower =
+            GrokBotFrameLower(player_.start_frame(), upper, directive.from_frame_zero);
         const auto step =
             GrokBotNextFrame(target, reverse_, lower, upper,
                              directive.mode == GrokBotDirector::PlayMode::kLoopPingPong,

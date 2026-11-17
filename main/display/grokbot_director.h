@@ -27,6 +27,7 @@ public:
         PlayMode mode;
         uint16_t max_frames;
         uint32_t seq;
+        bool from_frame_zero = false;
     };
 
     explicit GrokBotDirector(uint32_t seed = 1);
@@ -50,7 +51,8 @@ private:
     uint32_t Random();
     bool Available(const char* clip) const;
     const char* Fallback(const char* clip) const;
-    Directive Select(const char* clip, PlayMode mode, uint16_t max_frames, Layer layer);
+    Directive Select(const char* clip, PlayMode mode, uint16_t max_frames, Layer layer,
+                     bool from_frame_zero = false);
     void StartTransition(const char* clip, uint16_t max_frames = 0);
     void ResetIdle(bool after_conversation);
     void ScheduleFidget();
@@ -63,6 +65,7 @@ private:
     int64_t listening_since_ = 0;
     int64_t speech_since_ = -1;
     int64_t next_fidget_ = 0;
+    int64_t idle_pause_until_ = 0;
     int64_t notification_until_ = 0;
     int64_t emotion_until_ = 0;
     int64_t emotion_received_ = -2000;
@@ -79,12 +82,12 @@ private:
     bool ready_ = false;
     bool emotion_system_ = false;
     bool session_spoke_ = false;
-    bool thinking_tail_ = false;
     bool power_save_ = false;
     bool drowsy_ = false;
     bool sleeping_ = false;
     bool cycle_ = false;
     unsigned thinking_cycle_ = 0;
+    unsigned idle_breaths_ = 0;
     Layer layer_ = Layer::kBase;
     Directive current_{nullptr, PlayMode::kLoopPingPong, 0, 0};
 };

@@ -56,7 +56,7 @@ constexpr Emotion kEmotions[] = {
     {"angry", {{"angry", 75}, {"suspicious", 25}}},
     {"sad|crying", {{"sad", 70}, {"shy", 30}}},
     {"sleepy", {{"sleeping", 70}, {"drowsy", 30}}},
-    {"drowsy|low_battery", {{"drowsy", 75}, {"powering-down", 25}}},
+    {"drowsy|low_battery", {{"drowsy", 100}}},
     {"warning", {{"alerting", 100}}},
     {"gear", {{"loading", 100}}},
     {"cloud_download|download", {{"receiving", 100}}},
@@ -132,11 +132,12 @@ const char* GrokBotDirector::Fallback(const char* clip) const {
     return nullptr;
 }
 GrokBotDirector::Directive GrokBotDirector::Select(const char* clip, PlayMode mode,
-                                                   uint16_t max_frames, Layer layer) {
+                                                   uint16_t max_frames, Layer layer,
+                                                   bool from_frame_zero) {
     clip = Fallback(clip);
     if (!Equal(clip, current_.clip) || mode != current_.mode || max_frames != current_.max_frames ||
-        layer != layer_) {
-        current_ = {clip, mode, max_frames, current_.seq + 1};
+        layer != layer_ || from_frame_zero != current_.from_frame_zero) {
+        current_ = {clip, mode, max_frames, current_.seq + 1, from_frame_zero};
         layer_ = layer;
     }
     return current_;
@@ -150,6 +151,8 @@ void GrokBotDirector::ResetIdle(bool after_conversation) {
     idle_since_ = now_ - (after_conversation ? 0 : 20000);
     drowsy_ = false;
     sleeping_ = false;
+    idle_pause_until_ = 0;
+    idle_breaths_ = 0;
     ScheduleFidget();
 }
 void GrokBotDirector::ScheduleFidget() {
@@ -165,7 +168,6 @@ void GrokBotDirector::OnStatus(StatusId status) {
     if (status == StatusId::kIdle)
         ready_ = true;
     const bool keep_waking = Equal(transition_, "waking");
-    const uint16_t prev_max = transition_max_;
     const bool wake = keep_waking || sleeping_ || power_save_ || Equal(current_.clip, "sleeping") ||
                       (status_ == StatusId::kIdle && now_ - idle_since_ >= 120000);
     const bool finished = status == StatusId::kIdle &&
@@ -193,16 +195,16 @@ void GrokBotDirector::OnStatus(StatusId status) {
     if (status == StatusId::kIdle) {
         ResetIdle(!first_idle);
         if (first_idle)
-            StartTransition("spawning", 75);
+            StartTransition("logo", 57);
         else if (wake)
-            StartTransition("waking", Equal(current_.clip, "waking") ? prev_max : 48);
+            StartTransition("waking", 73);
         else if (finished)
-            StartTransition("finished");
+            StartTransition("finished", 30);
     } else if (wake && (status == StatusId::kListening || status == StatusId::kLoading)) {
         power_save_ = false;
         drowsy_ = false;
         sleeping_ = false;
-        StartTransition("waking", Equal(current_.clip, "waking") ? prev_max : 30);
+        StartTransition("waking", 73);
     } else if (status == StatusId::kFailed)
         StartTransition("confused");
 }
@@ -262,7 +264,6 @@ void GrokBotDirector::OnUserSpeech() {
     if (status_ == StatusId::kListening) {
         speech_since_ = now_;
         thinking_cycle_ = 0;
-        thinking_tail_ = false;
     }
     if (status_ == StatusId::kIdle)
         ResetIdle(true);
@@ -290,20 +291,23 @@ void GrokBotDirector::OnPowerSave(bool on) {
     emotion_group_ = -1;
     drowsy_ = false;
     if (on) {
-        StartTransition("powering-down", 60);
+        StartTransition("drowsy", 42);
         sleeping_ = !transition_;
     } else {
         sleeping_ = false;
         ResetIdle(true);
-        StartTransition("waking", status_ == StatusId::kIdle ? 48 : 30);
+        StartTransition("waking", 73);
     }
 }
 void GrokBotDirector::OnClipEvent(ClipEvent event) {
     if (event == ClipEvent::kOnceDone) {
         if (layer_ == Layer::kTransition && Equal(current_.clip, transition_)) {
-            if (Equal(transition_, "powering-down"))
+            if (power_save_)
                 sleeping_ = true;
             transition_ = nullptr;
+        } else if (layer_ == Layer::kThinking) {
+            ++thinking_cycle_;
+            ++current_.seq;  // Older atlases can map consecutive stages to the same clip.
         } else if (layer_ == Layer::kNotification) {
             notification_until_ = 0;
         } else if (layer_ == Layer::kEmotion && Equal(current_.clip, emotion_)) {
@@ -311,12 +315,12 @@ void GrokBotDirector::OnClipEvent(ClipEvent event) {
             emotion_group_ = -1;
         } else if (layer_ == Layer::kFidget && Equal(current_.clip, fidget_)) {
             fidget_ = nullptr;
+            idle_pause_until_ = 0;
+            idle_breaths_ = 0;
             ScheduleFidget();
         }
     } else {
         cycle_ = true;
-        if (layer_ == Layer::kThinking && thinking_tail_)
-            ++thinking_cycle_;
     }
 }
 const char* GrokBotDirector::PickFidget() {
@@ -324,8 +328,8 @@ const char* GrokBotDirector::PickFidget() {
         {"humming", 35}, {"curious", 30}, {"happy", 20}, {"playful", 15}};
     static constexpr Choice normal[] = {{"curious", 24},        {"humming", 22},  {"playful", 16},
                                         {"suspicious", 14, 90}, {"proud", 9, 75}, {"shy", 6, 90},
-                                        {"turntable", 5},       {"celebrate", 3}, {"logo", 1, 75}};
-    static constexpr Choice late[] = {{"drowsy", 55}, {"humming", 30}, {"shy", 15}};
+                                        {"turntable", 5},       {"celebrate", 3}, {"logo", 1, 57}};
+    static constexpr Choice late[] = {{"drowsy", 55}, {"humming", 30}, {"shy", 15, 90}};
     const int64_t age = now_ - idle_since_;
     const Choice* choices = age < 20000 ? early : age < 120000 ? normal : late;
     const size_t count = age < 20000 ? 4 : age < 120000 ? 9 : 3;
@@ -431,14 +435,14 @@ GrokBotDirector::Directive GrokBotDirector::Step(int64_t now_ms) {
     if (status_ == StatusId::kListening) {
         if (speech_since_ < 0)
             return Select("listening", PlayMode::kLoopPingPong, 0, Layer::kBase);
-        const int64_t age = now_ - speech_since_;
-        thinking_tail_ = age >= 6500;
-        const char* clip = age < 2500                 ? "thinking"
-                           : age < 6500               ? "working"
-                           : thinking_cycle_ % 3 == 0 ? "searching"
-                           : thinking_cycle_ % 3 == 1 ? "writing"
-                                                      : "working";
-        return Select(clip, PlayMode::kLoopPingPong, 0, Layer::kThinking);
+        const char* clip = thinking_cycle_ == 0             ? "thinking"
+                           : thinking_cycle_ == 1           ? "working"
+                           : (thinking_cycle_ - 2) % 3 == 0 ? "searching"
+                           : (thinking_cycle_ - 2) % 3 == 1 ? "writing"
+                                                            : "working";
+        // Returning to the shared frame zero joins thought clips without a brightness jump.
+        return Select(clip, PlayMode::kOncePingPong, thinking_cycle_ < 2 ? 31 : 0, Layer::kThinking,
+                      true);
     }
     if (status_ == StatusId::kStreaming) {
         const char* clip = (emotion_ && !Equal(emotion_, "idle")) ? emotion_ : "streaming";
@@ -473,5 +477,18 @@ GrokBotDirector::Directive GrokBotDirector::Step(int64_t now_ms) {
         else
             return Select(fidget_, OnceMode(fidget_), transition_max_, Layer::kFidget);
     }
-    return Select("idle", PlayMode::kLoopPingPong, 0, Layer::kBase);
+    if (layer_ != Layer::kBase || !Equal(current_.clip, "idle")) {
+        idle_pause_until_ = 0;
+        idle_breaths_ = 0;
+    } else if (boundary) {
+        if (idle_pause_until_) {
+            if (now_ >= idle_pause_until_)
+                idle_pause_until_ = 0;
+        } else if (++idle_breaths_ >= 2 && Random() % 3 == 0) {
+            // Two full breaths before a 0.4-2.8s pause keep breathing above 80% of base time.
+            idle_pause_until_ = now_ + (1 + Random() % 7) * 400;
+            idle_breaths_ = 0;
+        }
+    }
+    return Select("idle", PlayMode::kLoopPingPong, idle_pause_until_ ? 15 : 0, Layer::kBase);
 }

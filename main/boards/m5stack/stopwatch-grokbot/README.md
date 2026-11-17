@@ -46,11 +46,12 @@ Built-in Xiaozhi emoji names select from weighted multi-variant GrokBot pools
 | angry | `angry`, `suspicious` |
 | crying, sad | `sad`, `shy` |
 | sleepy | `sleeping`, `drowsy` |
-| drowsy, low_battery | `drowsy`, `powering-down` |
+| drowsy, low_battery | `drowsy` |
 | warning | `alerting` |
 
 Additional clips and mappings in the 39-clip subset:
-- `spawning`, `powering-down`: boot reveal and power-save sleep transition.
+- `logo`: non-black boot reveal (frames 2–56, once ping-pong). `spawning` and
+  `powering-down` remain packaged; automatic boot/sleep transitions avoid their dark holds.
 - `humming`, `suspicious`, `celebrate`, `turntable`, `logo`: idle fidgets, easter eggs, and emotion variants.
 - `working`, `writing`: multi-stage thinking chain (`thinking` -> `working` -> `searching`/`writing`/`working`).
 - `finished`: one-shot completion transition when returning to idle after speaking (including auto-mode `streaming` -> `listening` -> `idle`) or after >=1.5s of listening.
@@ -61,11 +62,23 @@ Additional clips and mappings in the 39-clip subset:
 - **Idle phases**: 0–20s post-chat afterglow (`humming`/`curious`/`happy`/`playful`),
   20–120s exploration & easter eggs (`turntable`/`celebrate`/`logo`), 120–240s getting
   sleepy (`drowsy`/`humming`/`shy`), 240–300s `drowsy` loop (entered on cycle boundary without interrupting active fidgets), and >=300s `sleeping` loop.
+  Fidget cooldowns after completion are 6–11s / 10–18s / 8–15s respectively.
+  Base idle keeps the complete breathing ping-pong (`idle[2..179]`); each end is a
+  switch seam (~5.9s apart). After at least two breathing passes, each seam has a
+  1-in-3 chance of inserting a random 0.4–2.8s pause (`idle[2..14]`); pauses then
+  resume breathing. Thus full breathing occupies >80% of base time. Due fidgets
+  take priority at seams: at most ~5.9s late while breathing, ~0.4s during a pause.
+  Boot deliberately starts with 20s of idle age:
+  exploration starts immediately, getting sleepy at 100s, `drowsy` at >=220s and
+  `sleeping` at >=280s (each waits for the current animation boundary).
   Minute clock status updates (`HH:MM`) do not reset the idle timer.
-- **Transitions**: Boot starts with `spawning`; waking from deep sleep/power-save plays
-  `waking`; user speech during listening starts the `thinking` -> `working` ->
-  `searching`/`writing`/`working` chain; non-neutral emotions during speaking override
-  `streaming` for 8s and return on a cycle boundary (up to 2s grace, with `idle` variants falling back to `streaming`); session end plays `finished` before returning to idle.
+- **Transitions**: Boot starts with `logo`; power-save plays a `drowsy` round trip
+  before `sleeping`, with the whole transition at 30 FPS before the 5 FPS sleep loop.
+  Waking plays `waking[2..72]`, ending near the idle face. User speech during listening
+  starts `thinking` -> `working` -> `searching`/`writing`/`working`: the first two
+  round trips last ~2.03s each (frames 0–30–0), and every thought clip returns to
+  its shared frame 0 before the next starts; non-neutral emotions during speaking override
+  `streaming` for 8s and return on a cycle boundary (up to 2s grace, with `idle` variants falling back to `streaming`); session end plays `finished[2..29]` (~0.93s) before returning to idle.
 
 Button 1 keeps the normal wake/chat behavior and Button 2 keeps the normal
 volume behavior. No GrokBot showcase controls are assigned to them.

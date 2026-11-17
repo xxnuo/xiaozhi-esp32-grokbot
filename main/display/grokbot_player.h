@@ -21,8 +21,8 @@ inline int GrokBotFrameUpper(int frame_count, uint16_t max_frames) {
     return (max_frames && max_frames < frame_count ? max_frames : frame_count) - 1;
 }
 
-inline int GrokBotFrameLower(int start_frame, int upper) {
-    return start_frame < upper ? start_frame : upper;
+inline int GrokBotFrameLower(int start_frame, int upper, bool from_frame_zero = false) {
+    return from_frame_zero ? 0 : start_frame < upper ? start_frame : upper;
 }
 
 struct GrokBotFrameStep {
