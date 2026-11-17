@@ -1,4 +1,5 @@
 #include "grokbot_director.h"
+#include "grokbot_face.h"
 #include "grokbot_player.h"
 
 #include <cstdint>
@@ -6,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -70,13 +72,53 @@ bool LoadAtlasMeta(const std::string& path, AtlasMeta* out) {
     return true;
 }
 
+int RenderFaceFrames(const AtlasMeta& atlas) {
+    if (!atlas.width || !atlas.height || atlas.width > 512 || atlas.height > 512 ||
+        atlas.width % 2) {
+        std::fprintf(stderr, "Invalid face render dimensions\n");
+        return 1;
+    }
+    GrokBotFace face;  // Match the firmware's default face seed; --seed controls the director.
+    std::vector<uint8_t> packed(static_cast<size_t>(atlas.width) * atlas.height / 2);
+    int64_t now_ms;
+    uint32_t sequence, previous_sequence = 0;
+    std::string clip;
+    int mode, present;
+    while (std::cin >> now_ms >> sequence >> clip >> mode >> present) {
+        if (now_ms < 0 || clip.size() > 16 || mode < 0 || mode > 2 || present < 0 || present > 1)
+            return 1;
+        if (sequence != previous_sequence) {
+            if (mode == 2)
+                face.BeginAtlasBridge(now_ms);
+            else
+                face.Select(clip.c_str(), sequence, now_ms);
+            previous_sequence = sequence;
+        }
+        if (mode && present && !face.Render(packed.data(), atlas.width, atlas.height, now_ms))
+            return 1;
+        if (std::fputc(mode ? 1 : 0, stdout) == EOF ||
+            (mode && std::fwrite(packed.data(), 1, packed.size(), stdout) != packed.size()) ||
+            std::fflush(stdout) != 0)
+            return 1;
+    }
+    return std::cin.eof() ? 0 : 1;
+}
+
 struct Action {
     int64_t at_ms;
-    enum class Type { kStatus, kEmotion, kUserSpeech, kPowerSave, kNotification } type;
+    enum class Type {
+        kStatus,
+        kEmotion,
+        kUserSpeech,
+        kPowerSave,
+        kNotification,
+        kInteraction
+    } type;
     GrokBotDirector::StatusId status = GrokBotDirector::StatusId::kIdle;
     const char* str_arg = nullptr;
     bool bool_arg = false;
     int64_t until_ms = 0;
+    const char* interaction_label = nullptr;
 };
 
 class Simulator {
@@ -102,6 +144,9 @@ public:
                 director_.SetNow(now_ms);
                 switch (act.type) {
                     case Action::Type::kStatus:
+                        if (business_status_ != act.status)
+                            presentation_budget_ = 30;
+                        business_status_ = act.status;
                         director_.OnStatus(act.status);
                         break;
                     case Action::Type::kEmotion:
@@ -116,6 +161,11 @@ public:
                         break;
                     case Action::Type::kNotification:
                         director_.OnNotification(act.until_ms, act.str_arg);
+                        break;
+                    case Action::Type::kInteraction:
+                        std::printf("# interaction %lld %s %s %d\n", static_cast<long long>(now_ms),
+                                    act.interaction_label, act.str_arg,
+                                    director_.OnInteraction(act.str_arg));
                         break;
                 }
             }
@@ -134,32 +184,58 @@ public:
                                  next.clip ? next.clip : "(null)");
                     std::exit(1);
                 }
-                if (has_selected_)
+                const bool previous_geometry =
+                    GrokBotFace::Supports(directive_.clip) || face_exit_until_ > now_ms;
+                const bool bridge_to_icon = has_selected_ && previous_geometry &&
+                                            GrokBotFace::AtlasBridgeSupported(next.clip);
+                if (has_selected_ && !bridge_to_icon &&
+                    !(previous_geometry && GrokBotFace::Supports(next.clip)))
                     fade_step_ = 0;
+                else
+                    fade_step_ = kGrokBotFadeFrames;
+                face_exit_until_ = bridge_to_icon ? now_ms + 350 : 0;
                 current_clip_ = cm;
                 directive_ = next;
+                if (bridge_to_icon)
+                    directive_.from_frame_zero = true;
                 const int upper = GrokBotFrameUpper(current_clip_->frames, directive_.max_frames);
                 current_index_ = GrokBotFrameLower(current_clip_->start_frame, upper,
                                                    directive_.from_frame_zero);
                 reverse_ = false;
                 has_selected_ = true;
                 once_done_ = false;
-                held_frames_ = 0;
+                presentation_budget_ = 30;
             }
 
-            std::printf("%lld %s %d %u\n", static_cast<long long>(now_ms), directive_.clip,
-                        current_index_, directive_.seq);
+            const bool face_exiting = now_ms < face_exit_until_;
+            const int face_mode = face_exiting ? 2 : GrokBotFace::Supports(directive_.clip) ? 1 : 0;
+            const bool voice_active = business_status_ == GrokBotDirector::StatusId::kListening ||
+                                      business_status_ == GrokBotDirector::StatusId::kStreaming;
+            const int fps = power_save_ && std::strcmp(directive_.clip, "sleeping") == 0 &&
+                                    fade_step_ >= kGrokBotFadeFrames
+                                ? 5
+                            : voice_active ? 20
+                                           : 30;
+            if (fps != previous_fps_)
+                presentation_budget_ = 30;
+            previous_fps_ = fps;
+            const bool present = !once_done_ && presentation_budget_ >= 30;
+            if (present) {
+                presentation_budget_ -= 30;
+                presented_index_ = current_index_;
+                presented_fade_step_ = fade_step_;
+                presented_face_mode_ = face_mode;
+            }
+            std::printf("%lld %s %d %u %u %d %d\n", static_cast<long long>(now_ms), directive_.clip,
+                        presented_index_, directive_.seq, presented_fade_step_,
+                        presented_face_mode_, present);
+            // 30Hz output quantizes the 20fps cadence to alternating 33/67ms gaps (~16ms error).
+            presentation_budget_ += fps;
 
-            const int repeats = power_save_ && std::strcmp(directive_.clip, "sleeping") == 0 &&
-                                        fade_step_ >= kGrokBotFadeFrames
-                                    ? 6
-                                    : 1;
-            if (fade_step_ < kGrokBotFadeFrames)
+            if (present && fade_step_ < kGrokBotFadeFrames)
                 ++fade_step_;
-            if (once_done_ || ++held_frames_ < repeats) {
+            if (!present || face_exiting)
                 continue;
-            }
-            held_frames_ = 0;
 
             const int target = current_index_;
             const int upper = GrokBotFrameUpper(current_clip_->frames, directive_.max_frames);
@@ -192,8 +268,14 @@ private:
     bool event_pending_ = false;
     bool once_done_ = false;
     bool power_save_ = false;
-    int held_frames_ = 0;
+    GrokBotDirector::StatusId business_status_ = GrokBotDirector::StatusId::kIdle;
+    int presentation_budget_ = 30;
+    int previous_fps_ = 30;
+    int presented_index_ = 0;
+    unsigned presented_fade_step_ = kGrokBotFadeFrames;
+    int presented_face_mode_ = 0;
     unsigned fade_step_ = kGrokBotFadeFrames;
+    int64_t face_exit_until_ = 0;
 };
 
 }  // namespace
@@ -202,10 +284,13 @@ int main(int argc, char** argv) {
     std::string scenario = "boot_idle";
     std::string atlas_path = "main/boards/m5stack/stopwatch-grokbot/assets/grokbot.atlas";
     uint32_t seed = 42;
+    bool face_raw = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--atlas" && i + 1 < argc) {
+        if (arg == "--face-raw") {
+            face_raw = true;
+        } else if (arg == "--atlas" && i + 1 < argc) {
             atlas_path = argv[++i];
         } else if (arg == "--seed" && i + 1 < argc) {
             seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
@@ -214,10 +299,10 @@ int main(int argc, char** argv) {
         } else if (arg[0] != '-') {
             scenario = arg;
         } else {
-            std::fprintf(
-                stderr,
-                "Usage: %s [boot_idle|conversation|wake_from_sleep] [--atlas path] [--seed N]\n",
-                argv[0]);
+            std::fprintf(stderr,
+                         "Usage: %s [boot_idle|conversation|wake_from_sleep|interactions] "
+                         "[--atlas path] [--seed N]\n",
+                         argv[0]);
             return 1;
         }
     }
@@ -227,6 +312,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Failed to load atlas: %s\n", atlas_path.c_str());
         return 1;
     }
+    if (face_raw)
+        return RenderFaceFrames(atlas);
 
     using Status = GrokBotDirector::StatusId;
     std::vector<Action> actions;
@@ -270,6 +357,22 @@ int main(int argc, char** argv) {
         actions.push_back({22900, Action::Type::kUserSpeech});
         actions.push_back({28000, Action::Type::kStatus, Status::kIdle});
         duration_ms = 30000;
+    } else if (scenario == "interactions") {
+        // Simulated inputs use the board's emotion mapping, not recorded sensor readings.
+        actions.push_back({0, Action::Type::kStatus, Status::kIdle});
+        actions.push_back(
+            {4000, Action::Type::kInteraction, Status::kIdle, "happy", false, 0, "tap"});
+        actions.push_back(
+            {10000, Action::Type::kInteraction, Status::kIdle, "loving", false, 0, "stroke"});
+        actions.push_back(
+            {16000, Action::Type::kInteraction, Status::kIdle, "confused", false, 0, "shake"});
+        actions.push_back(
+            {22000, Action::Type::kInteraction, Status::kIdle, "curious", false, 0, "tilt"});
+        actions.push_back({28000, Action::Type::kStatus, Status::kListening});
+        actions.push_back(
+            {28500, Action::Type::kInteraction, Status::kIdle, "happy", false, 0, "tap"});
+        actions.push_back({31000, Action::Type::kStatus, Status::kIdle});
+        duration_ms = 35000;
     } else {
         std::fprintf(stderr, "Unknown scenario: %s\n", scenario.c_str());
         return 1;

@@ -57,22 +57,108 @@ class GrokBotPreviewTests(unittest.TestCase):
         sleeping = [frame for frame in frames if 6133 <= frame[0] < 10000]
         self.assertEqual(len(sleeping), 116)
         self.assertTrue(all(clip == "sleeping" for _, clip, _ in sleeping))
-        self.assertEqual([index for _, _, index in sleeping[:6]], list(range(2, 8)))
-        sleeping = sleeping[6:]
+        # Geometry-to-geometry uses its internal bridge, so there is no six-frame atlas fade.
         for offset in range(0, len(sleeping) - 6, 6):
             group = sleeping[offset:offset + 6]
-            self.assertEqual([index for _, _, index in group], [8 + offset // 6] * 6)
+            self.assertEqual([index for _, _, index in group], [2 + offset // 6] * 6)
             self.assertEqual(sleeping[offset + 6][0] - group[0][0], 200)
         waking = [frame for frame in frames if 10000 <= frame[0] < 10200]
         self.assertEqual([index for _, clip, index in waking], list(range(2, 8)))
         self.assertTrue(all(clip == "waking" for _, clip, _ in waking))
-        first_wake = [frame for frame in frames if 10000 <= frame[0] < 12366]
+        first_wake = [frame for i, frame in enumerate(frames)
+                      if 10000 <= frame[0] < 13400 and frames.presentations[i]]
         self.assertEqual([index for _, _, index in first_wake], list(range(2, 73)))
         self.assertTrue(all(clip == "waking" for _, clip, _ in first_wake))
-        after_wake = next(clip for ms, clip, _ in frames if ms == 12366)
+        after_wake = next(clip for ms, clip, _ in frames if ms == 13400)
         self.assertNotIn(after_wake, ("waking", "thinking", "streaming"))
-        self.assertTrue(all(clip == "waking" for ms, clip, _ in frames if 21000 <= ms < 23366))
-        self.assertEqual(next(clip for ms, clip, _ in frames if ms == 23366), "thinking")
+        self.assertTrue(all(clip == "waking" for ms, clip, _ in frames if 21000 <= ms < 24400))
+        self.assertEqual(next(clip for ms, clip, _ in frames if ms == 24400), "thinking")
+        # Business changes reset cadence even while the visual waking clip remains selected.
+        after_status = [(ms, frames.presentations[i]) for i, (ms, _, _) in enumerate(frames)
+                        if 10300 <= ms < 10450]
+        self.assertEqual(after_status, [(10300, True), (10333, False), (10366, True),
+                                        (10400, False), (10433, True)])
+
+    def test_real_face_renderer_and_icon_bridge_use_firmware_time(self):
+        if not shutil.which("g++"):
+            self.skipTest("g++ unavailable")
+        preview, root = self.preview, self.root
+        binary = preview.compile_simulator(root)
+        atlas_path = root / "main/boards/m5stack/stopwatch-grokbot/assets/grokbot.atlas"
+        frames = preview.run_simulation(binary, atlas_path, "conversation", 42)
+        emotion = next(i for i, frame in enumerate(frames) if frame[0] == 12500)
+        self.assertEqual(frames.face_modes[emotion], 1)
+        self.assertEqual(frames.fade_steps[emotion], 6)
+        bridge = [i for i, (ms, _, _) in enumerate(frames) if 5500 <= ms < 5850]
+        self.assertEqual(len(bridge), 11)
+        self.assertTrue(all(frames.face_modes[i] == 2 and frames[i][2] == 0 and
+                            frames.fade_steps[i] == 6 for i in bridge))
+        icon = bridge[-1] + 1
+        self.assertEqual(frames[icon][:3], (5866, "thinking", 0))
+        self.assertEqual(frames.face_modes[icon], 0)
+        for start, end, count in ((3500, 5500, 40), (11500, 12500, 20), (30000, 31000, 30)):
+            presented = [ms for i, (ms, _, _) in enumerate(frames)
+                         if start <= ms < end and frames.presentations[i]]
+            self.assertEqual(len(presented), count)
+            if count < (end - start) * 30 // 1000:
+                self.assertTrue(all(33 <= b - a <= 67 for a, b in zip(presented, presented[1:])))
+        for i, (_, _, index) in enumerate(frames):
+            if not frames.presentations[i]:
+                self.assertEqual(index, frames[i - 1][2])
+
+        # Compare the bridge's packed bytes with a separate, direct firmware Render() caller.
+        atlas = preview.AtlasDecoder(atlas_path)
+        source = '''#include "grokbot_face.h"
+#include <cstdio>
+#include <vector>
+int main() {
+    GrokBotFace face;
+    std::vector<unsigned char> packed(360 * 360 / 2);
+    face.Select("idle", 1, 0);
+    for (int ms : {0, 33, 66, 100}) {
+        if (!face.Render(packed.data(), 360, 360, ms)) return 1;
+        if (std::fwrite(packed.data(), 1, packed.size(), stdout) != packed.size()) return 2;
+    }
+}'''
+        with tempfile.TemporaryDirectory(dir=root / ".tmp") as directory:
+            driver = Path(directory) / "direct-face"
+            subprocess.run(
+                ["g++", "-std=c++17", "-O2", "-I", str(root / "main/display"),
+                 str(root / "main/display/grokbot_face.cc"), "-x", "c++", "-", "-o", str(driver)],
+                input=source, text=True, check=True, capture_output=True,
+            )
+            expected = subprocess.run([str(driver)], capture_output=True, check=True).stdout
+        renderer = preview.FaceRenderer(frames, atlas)
+        try:
+            actual = []
+            for ms in (0, 33, 66, 100):
+                gray = renderer.frame(ms, "idle", 1, 1, True).reshape(-1) // 17
+                actual.append(((gray[0::2] << 4) | gray[1::2]).tobytes())
+            self.assertEqual(b"".join(actual), expected)
+        finally:
+            renderer.close()
+
+    def test_interactions_are_labelled_simulations_and_busy_input_is_ignored(self):
+        if not shutil.which("g++"):
+            self.skipTest("g++ unavailable")
+        preview, root = self.preview, self.root
+        binary = preview.compile_simulator(root)
+        frames = preview.run_simulation(
+            binary, root / "main/boards/m5stack/stopwatch-grokbot/assets/grokbot.atlas",
+            "interactions", 42,
+        )
+        self.assertEqual([(event["gesture"], event["emotion"], event["accepted"])
+                          for event in frames.interactions], [
+            ("tap", "happy", True), ("stroke", "loving", True),
+            ("shake", "confused", True), ("tilt", "curious", True), ("tap", "happy", False),
+        ])
+        self.assertTrue(all(clip == "listening" for ms, clip, _ in frames if 28500 <= ms < 31000))
+        with tempfile.TemporaryDirectory(dir=root / ".tmp") as directory:
+            timeline = Path(directory) / "timeline.txt"
+            preview.write_timeline(timeline, "interactions", preview.extract_transitions(frames),
+                                   frames.interactions)
+            self.assertIn("SIMULATED input at 4000ms: tap -> happy (accepted)", timeline.read_text())
+            self.assertIn("ignored while busy", timeline.read_text())
 
 
     def test_six_frame_blend_and_interrupted_fade(self):

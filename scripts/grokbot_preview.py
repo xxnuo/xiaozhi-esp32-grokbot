@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Host-side GrokBot director preview generator.
 
-Compiles scripts/grokbot_preview.cc against main/display/grokbot_director.cc,
-decodes main/boards/m5stack/stopwatch-grokbot/assets/grokbot.atlas, and renders
+Compiles the firmware director and GrokBotFace renderer, retains atlas icons, and renders
 MP4 preview videos, transition timelines, and contact sheets under .tmp/preview/.
+The 30Hz simulation samples 20fps voice presentation with roughly 16ms timing quantization.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ CLIP_HEADER = struct.Struct("<16sHHIII")
 FRAME_HEADER = struct.Struct("<IB3x")
 FRAME_INDEX = struct.Struct("<II")
 
-SCENARIOS = ("boot_idle", "conversation", "wake_from_sleep")
+SCENARIOS = ("boot_idle", "conversation", "wake_from_sleep", "interactions")
 DISPLAY_GRAY_LUT = np.rint(255 * (np.arange(16) / 15) ** (1 / 2.2)).astype(np.uint8)
 
 
@@ -118,6 +118,7 @@ def compile_simulator(root: Path) -> Path:
         "-I",
         str(root / "main/display"),
         str(root / "main/display/grokbot_director.cc"),
+        str(root / "main/display/grokbot_face.cc"),
         str(root / "scripts/grokbot_preview.cc"),
         "-o",
         str(binary),
@@ -128,6 +129,7 @@ def compile_simulator(root: Path) -> Path:
 
 class SimulationFrames(list):
     sequences: list[int]
+    interactions: list[dict]
 
 
 def run_simulation(
@@ -141,12 +143,58 @@ def run_simulation(
     )
     frames = SimulationFrames()
     frames.sequences = []
+    frames.interactions = []
+    frames.fade_steps = []
+    frames.face_modes = []
+    frames.presentations = []
+    frames.face_binary = binary
+    frames.atlas_path = atlas_path
     for line in res.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 4:
+        if len(parts) == 6 and parts[:2] == ["#", "interaction"]:
+            frames.interactions.append({
+                "at_ms": int(parts[2]), "gesture": parts[3], "emotion": parts[4],
+                "accepted": bool(int(parts[5])),
+            })
+        elif len(parts) == 7:
             frames.append((int(parts[0]), parts[1], int(parts[2])))
             frames.sequences.append(int(parts[3]))
+            frames.fade_steps.append(int(parts[4]))
+            frames.face_modes.append(int(parts[5]))
+            frames.presentations.append(bool(int(parts[6])))
     return frames
+
+
+class FaceRenderer:
+    def __init__(self, frames: SimulationFrames, atlas: AtlasDecoder):
+        self.packed_size = atlas.width * atlas.height // 2
+        self.width, self.height = atlas.width, atlas.height
+        self.proc = subprocess.Popen(
+            [str(frames.face_binary), "--face-raw", "--atlas", str(frames.atlas_path)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        )
+
+    def frame(self, ms: int, clip: str, sequence: int, mode: int,
+              present: bool) -> np.ndarray | None:
+        self.proc.stdin.write(f"{ms} {sequence} {clip} {mode} {int(present)}\n".encode("ascii"))
+        self.proc.stdin.flush()
+        flag = self.proc.stdout.read(1)
+        if flag == b"\0":
+            return None
+        packed = self.proc.stdout.read(self.packed_size) if flag == b"\1" else b""
+        if len(packed) != self.packed_size:
+            raise RuntimeError("GrokBotFace renderer returned an incomplete frame")
+        source = np.frombuffer(packed, dtype=np.uint8)
+        gray = np.empty(source.size * 2, dtype=np.uint8)
+        gray[0::2], gray[1::2] = (source >> 4) * 17, (source & 15) * 17
+        return gray.reshape(self.height, self.width)
+
+    def close(self) -> None:
+        self.proc.stdin.close()
+        self.proc.stdout.close()
+        result = self.proc.wait(timeout=10)
+        if result:
+            raise RuntimeError(f"GrokBotFace renderer exited with status {result}")
 
 
 def extract_transitions(frames: list[tuple[int, str, int]]) -> list[dict]:
@@ -179,26 +227,31 @@ def extract_transitions(frames: list[tuple[int, str, int]]) -> list[dict]:
 
 def write_stats(path: Path, atlas: AtlasDecoder, frames: list[tuple[int, str, int]],
                 transitions: list[dict]) -> dict:
-    idle = np.asarray(atlas.get_clip_frames("idle", atlas.width), dtype=np.float32)
-    reference_mae = np.abs(idle - idle[2]).mean(axis=(1, 2))
-    base_frames = [index for _, clip, index in frames if clip == "idle"]
-    adjacent_mae = [
-        float(np.abs(idle[index] - idle[old_index]).mean())
-        for (_, old_clip, old_index), (_, clip, index) in zip(frames, frames[1:])
-        if old_clip == clip == "idle"
-    ]
+    stats = getattr(frames, "rendered_idle_stats", None)
+    if stats is None:
+        idle = np.asarray(atlas.get_clip_frames("idle", atlas.width), dtype=np.float32)
+        reference_mae = np.abs(idle - idle[2]).mean(axis=(1, 2))
+        base_frames = [index for _, clip, index in frames if clip == "idle"]
+        adjacent_mae = [
+            float(np.abs(idle[index] - idle[old_index]).mean())
+            for (_, old_clip, old_index), (_, clip, index) in zip(frames, frames[1:])
+            if old_clip == clip == "idle"
+        ]
+        stats = {
+            "idle_base_frames": len(base_frames),
+            "idle_nonstatic_reference_percent": round(
+                100 * sum(reference_mae[i] > 0.01 for i in base_frames) / max(1, len(base_frames)), 2
+            ),
+            "idle_moving_adjacent_percent": round(
+                100 * sum(mae > 0.01 for mae in adjacent_mae) / max(1, len(adjacent_mae)), 2
+            ),
+        }
     waits = [
         {"start_s": tr["start_ms"] / 1000, "seconds": tr["duration_ms"] / 1000}
         for tr in transitions[:-1] if tr["clip"] == "idle"
     ]
     stats = {
-        "idle_base_frames": len(base_frames),
-        "idle_nonstatic_reference_percent": round(
-            100 * sum(reference_mae[i] > 0.01 for i in base_frames) / max(1, len(base_frames)), 2
-        ),
-        "idle_moving_adjacent_percent": round(
-            100 * sum(mae > 0.01 for mae in adjacent_mae) / max(1, len(adjacent_mae)), 2
-        ),
+        **stats,
         "idle_waits": waits,
         "mae_threshold": 0.01,
     }
@@ -206,10 +259,15 @@ def write_stats(path: Path, atlas: AtlasDecoder, frames: list[tuple[int, str, in
     return stats
 
 
-def write_timeline(path: Path, scenario: str, transitions: list[dict]) -> None:
+def write_timeline(path: Path, scenario: str, transitions: list[dict],
+                   interactions: list[dict] | None = None) -> None:
     col_idx = "idx"
     lines = [
         f"Scenario: {scenario} (transitions={len(transitions)})",
+        "Presentation: voice=20fps idle=30fps power-save sleep=5fps; 30Hz sampling, ~16ms quantization",
+        *[f"SIMULATED input at {event['at_ms']}ms: {event['gesture']} -> {event['emotion']} "
+          f"({'accepted' if event['accepted'] else 'ignored while busy'})"
+          for event in interactions or ()],
         f"{col_idx:>3}  {'start_ms':>8}  {'time_s':>7}  {'dur_s':>6}  {'clip':<16}  {'start_frame':>11}",
         "-" * 62,
     ]
@@ -221,7 +279,8 @@ def write_timeline(path: Path, scenario: str, transitions: list[dict]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def annotate_frame(gray: np.ndarray, ms: int, clip: str, frame_idx: int) -> np.ndarray:
+def annotate_frame(gray: np.ndarray, ms: int, clip: str, frame_idx: int,
+                   interaction: dict | None = None) -> np.ndarray:
     img = Image.fromarray(gray, mode="L")
     draw = ImageDraw.Draw(img)
     font = ImageFont.load_default()
@@ -230,6 +289,13 @@ def annotate_frame(gray: np.ndarray, ms: int, clip: str, frame_idx: int) -> np.n
     draw.rectangle((2, 2, 128, 28), fill=0)
     draw.text((5, 3), text1, fill=255, font=font)
     draw.text((5, 15), text2, fill=220, font=font)
+    if interaction and 0 <= ms - interaction["at_ms"] < 3500:
+        text = f"SIM: {interaction['gesture']} -> {interaction['emotion']}"
+        if not interaction["accepted"]:
+            text += " (ignored)"
+        draw.rectangle((2, img.height - 28, img.width - 2, img.height - 2), fill=0)
+        draw.text((5, img.height - 25), "SIMULATED INPUT", fill=255, font=font)
+        draw.text((5, img.height - 13), text, fill=220, font=font)
     return np.asarray(img, dtype=np.uint8)
 
 
@@ -238,23 +304,33 @@ def blended_frames(atlas: AtlasDecoder, frames: list[tuple[int, str, int]], size
     source = None
     last_sequence = None
     step = 6
-    for i, (_, clip, frame_idx) in enumerate(frames):
-        sequence = frames.sequences[i] if hasattr(frames, "sequences") else clip
-        if previous is not None and sequence != last_sequence:
-            source = previous.copy()
-            step = 0
-        gray = atlas.get_clip_frames(clip, atlas.width)[frame_idx]
-        if step < 6:
-            step += 1
-            # Match the device's rounded 4-bit blend before preview downsampling.
-            gray = (((source.astype(np.uint16) // 17) * (6 - step) +
-                     (gray.astype(np.uint16) // 17) * step + 3) // 6 * 17).astype(np.uint8)
-        previous = gray
-        last_sequence = sequence
-        gray = DISPLAY_GRAY_LUT[gray // 17]
-        if size != atlas.width:
-            gray = np.asarray(Image.fromarray(gray).resize((size, size), Image.Resampling.BILINEAR))
-        yield gray
+    renderer = FaceRenderer(frames, atlas) if hasattr(frames, "face_binary") else None
+    try:
+        for i, (ms, clip, frame_idx) in enumerate(frames):
+            sequence = frames.sequences[i] if hasattr(frames, "sequences") else clip
+            if previous is not None and sequence != last_sequence:
+                source = previous.copy()
+                step = frames.fade_steps[i] if renderer else 0
+            gray = renderer.frame(ms, clip, sequence, frames.face_modes[i],
+                                  frames.presentations[i]) if renderer else None
+            if gray is None:
+                gray = atlas.get_clip_frames(clip, atlas.width)[frame_idx]
+            if renderer:
+                step = frames.fade_steps[i]
+            if step < 6:
+                step += 1
+                # Match the device's rounded 4-bit blend before preview downsampling.
+                gray = (((source.astype(np.uint16) // 17) * (6 - step) +
+                         (gray.astype(np.uint16) // 17) * step + 3) // 6 * 17).astype(np.uint8)
+            previous = gray
+            last_sequence = sequence
+            gray = DISPLAY_GRAY_LUT[gray // 17]
+            if size != atlas.width:
+                gray = np.asarray(Image.fromarray(gray).resize((size, size), Image.Resampling.BILINEAR))
+            yield gray
+    finally:
+        if renderer:
+            renderer.close()
 
 
 def render_contact_sheet(
@@ -263,6 +339,7 @@ def render_contact_sheet(
     frames: list[tuple[int, str, int]],
     transitions: list[dict],
     thumb_size: int = 140,
+    samples: dict[int, np.ndarray] | None = None,
 ) -> None:
     count = len(transitions)
     cols = min(5, max(1, count))
@@ -272,21 +349,29 @@ def render_contact_sheet(
     cell_w = thumb_size + pad * 2
     cell_h = thumb_size + label_h + pad * 2
 
-    sheet = Image.new("L", (cols * cell_w, rows * cell_h), color=24)
+    title_h = 20 if getattr(frames, "interactions", ()) else 0
+    sheet = Image.new("L", (cols * cell_w, rows * cell_h + title_h), color=24)
     draw = ImageDraw.Draw(sheet)
     font = ImageFont.load_default()
+    if title_h:
+        draw.text((8, 4), "SIMULATED INPUTS: tap/happy, stroke/loving, shake/confused, tilt/curious",
+                  fill=255, font=font)
+    if samples is None:
+        wanted = {tr["start_step"] + min((tr["end_step"] - tr["start_step"]) // 2, 25)
+                  for tr in transitions}
+        samples = {i: gray for i, gray in enumerate(blended_frames(atlas, frames, thumb_size))
+                   if i in wanted}
 
     for idx, tr in enumerate(transitions):
         r = idx // cols
         c = idx % cols
         x0 = c * cell_w + pad
-        y0 = r * cell_h + pad
+        y0 = title_h + r * cell_h + pad
 
         span = tr["end_step"] - tr["start_step"]
         sample_step = tr["start_step"] + min(span // 2, 25)
         _, clip_name, sample_frame_idx = frames[sample_step]
-        clip_frames = atlas.get_clip_frames(clip_name, atlas.width)
-        frame_gray = DISPLAY_GRAY_LUT[clip_frames[sample_frame_idx] // 17]
+        frame_gray = samples[sample_step]
         frame_gray = np.asarray(Image.fromarray(frame_gray).resize(
             (thumb_size, thumb_size), Image.Resampling.BILINEAR))
 
@@ -309,6 +394,7 @@ def render_video(
     size: int,
     out_fps: int,
     speed: float,
+    contact_samples: dict[int, np.ndarray] | None = None,
 ) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -348,14 +434,36 @@ def render_video(
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     assert proc.stdin is not None
+    idle_reference = previous_idle = None
+    idle_count = reference_moving = adjacent_count = adjacent_moving = 0
     try:
         selected = iter(indices)
         next_index = next(selected, None)
+        interactions = iter(getattr(frames, "interactions", ()))
+        next_interaction = next(interactions, None)
+        last_interaction = None
         for i, gray in enumerate(blended_frames(atlas, frames, size)):
+            if contact_samples is not None and i in contact_samples:
+                contact_samples[i] = gray.copy()
+            if frames[i][1] == "idle":
+                idle = gray.astype(np.float32)
+                idle_count += 1
+                if idle_reference is None:
+                    idle_reference = idle.copy()
+                reference_moving += bool(np.abs(idle - idle_reference).mean() > 0.01)
+                if previous_idle is not None:
+                    adjacent_count += 1
+                    adjacent_moving += bool(np.abs(idle - previous_idle).mean() > 0.01)
+                previous_idle = idle
+            else:
+                previous_idle = None
             if i != next_index:
                 continue
             ms, clip_name, frame_idx = frames[i]
-            annotated = annotate_frame(gray, ms, clip_name, frame_idx)
+            while next_interaction and next_interaction["at_ms"] <= ms:
+                last_interaction = next_interaction
+                next_interaction = next(interactions, None)
+            annotated = annotate_frame(gray, ms, clip_name, frame_idx, last_interaction)
             while next_index == i:
                 proc.stdin.write(annotated.tobytes())
                 next_index = next(selected, None)
@@ -364,6 +472,12 @@ def render_video(
         ret = proc.wait()
         if ret != 0:
             raise RuntimeError(f"ffmpeg exited with status {ret}")
+    frames.rendered_idle_stats = {
+        "idle_base_frames": idle_count,
+        "idle_nonstatic_reference_percent": round(100 * reference_moving / max(1, idle_count), 2),
+        "idle_moving_adjacent_percent": round(100 * adjacent_moving / max(1, adjacent_count), 2),
+        "renderer": "firmware GrokBotFace + atlas icons",
+    }
 
 
 def main() -> None:
@@ -417,10 +531,12 @@ def main() -> None:
         contact_path = args.out_dir / f"{sc}_contact.png"
         video_path = args.out_dir / f"{sc}.mp4"
 
+        write_timeline(timeline_path, sc, transitions, frames.interactions)
+        samples = {tr["start_step"] + min((tr["end_step"] - tr["start_step"]) // 2, 25): None
+                   for tr in transitions}
+        render_video(video_path, atlas, frames, args.size, args.fps, speed, samples)
+        render_contact_sheet(contact_path, atlas, frames, transitions, samples=samples)
         stats = write_stats(args.out_dir / f"{sc}_stats.json", atlas, frames, transitions)
-        write_timeline(timeline_path, sc, transitions)
-        render_contact_sheet(contact_path, atlas, frames, transitions)
-        render_video(video_path, atlas, frames, args.size, args.fps, speed)
         print(
             f"[{sc}] speed={speed:g}x frames={len(frames)} transitions={len(transitions)} "
             f"idle motion={stats['idle_moving_adjacent_percent']}% -> "
