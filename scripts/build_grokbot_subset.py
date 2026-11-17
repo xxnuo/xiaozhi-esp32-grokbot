@@ -47,6 +47,17 @@ XIAOZHI_STATES = (
     "sad",
     "drowsy",
     "scared",
+    "humming",
+    "suspicious",
+    "finished",
+    "celebrate",
+    "working",
+    "turntable",
+    "logo",
+    "spawning",
+    "writing",
+    "receiving",
+    "powering-down",
 )
 
 
