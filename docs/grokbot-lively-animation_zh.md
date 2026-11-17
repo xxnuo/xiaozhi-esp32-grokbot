@@ -46,7 +46,8 @@
 
 - [x] 主机测试 `uv run python -m unittest discover -s scripts/tests`：169 项，1 跳过（缺 cJSON 开发头）。含导演测试与帧游标测试（`-UNDEBUG`，副作用不在断言内）。
 - [x] 固件：`espressif/idf:release-v6.1` 构建 `m5stack-stopwatch-grokbot` 成功，app `0x2dd600`，分区剩余 27%；assets 6,860,726 B < 8 MiB。
-- [ ] 真机：30fps 帧率与解码耗时、音频并发连续性、PSRAM 余量、TE 同步、10 分钟以上闲时全阶段观感、唤醒/思考/说话/结束过渡、旧 28-clip 资产降级。
+- [x] 真机闲时（2026-11-17，M5Stack StopWatch，SKU `m5stack-stopwatch-grokbot`，烧录 app + assets，保留 NVS）：加载 39 个 clip；闲时 29.55-29.71fps，解码约 15-18ms/帧，TE 59-60Hz 无超时；内部 SRAM 最低 33,468 B，PSRAM 余约 4.0 MB；330s 内无崩溃。实测时间线：logo 开机 -> idle(10.8s) -> suspicious/curious/humming/shy 小动作间隔约 12-18s，含随机停顿 -> 120s 起 drowsy/humming/shy -> 232s drowsy 循环 -> 288s sleeping。旧固件基线为 28 clip、开机 21.35fps。
+- [ ] 真机对话：唤醒/思考链/说话情绪/finished 过渡、音频并发连续性、省电睡眠与唤醒。
 
 提交：`ae616fb`（atlas）、`15cbf0c`（导演与显示层）。
 
