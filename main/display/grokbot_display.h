@@ -1,5 +1,6 @@
 #pragma once
 
+#include "grokbot_director.h"
 #include "grokbot_player.h"
 #include "lcd_display.h"
 
@@ -23,6 +24,7 @@ public:
     void SetupUI() override;
     bool SetEmotion(const char* emotion) override;
     void SetStatus(const char* status) override;
+    void SetChatMessage(const char* role, const char* content) override;
     void ShowNotification(const char* notification, int duration_ms = 3000) override;
     void ShowNotification(const std::string& notification, int duration_ms = 3000) override;
     void SetPowerSaveMode(bool on) override;
@@ -40,9 +42,13 @@ private:
     bool RebuildCurrentFrame();
     void ExpandPackedFrame();
     bool PresentFrame();
-    const char* EffectiveAnimationName();
     int64_t NowUs() const;
 
+    portMUX_TYPE mailbox_mux_ = portMUX_INITIALIZER_UNLOCKED;
+    GrokBotDirector director_;
+    bool assets_update_in_progress_ = false;
+    bool atlas_refresh_required_ = false;
+    bool power_save_ = false;
     GrokBotPlayer player_;
     const uint8_t* atlas_data_ = nullptr;
     size_t atlas_size_ = 0;
@@ -62,8 +68,8 @@ private:
     int write_buffer_ = 0;
 
     bool reverse_ = false;
-    bool rebuild_pending_ = false;
     bool has_selected_ = false;
+    int packed_index_ = -1;
     gpio_num_t te_pin_ = GPIO_NUM_NC;
     SemaphoreHandle_t te_semaphore_ = nullptr;
     bool te_isr_installed_ = false;
@@ -73,11 +79,6 @@ private:
     std::atomic<int64_t> te_wait_us_total_{0};
     uint32_t last_te_present_count_ = 0;
 
-    std::atomic<const char*> requested_status_{"idle"};
-    std::atomic<const char*> requested_emotion_{nullptr};
-    std::atomic<int64_t> notification_until_us_{0};
-    std::atomic<bool> assets_update_in_progress_{false};
-    std::atomic<bool> atlas_refresh_required_{false};
     std::atomic<int> target_fps_{30};
     std::atomic<bool> running_{false};
     int64_t decode_us_total_ = 0;

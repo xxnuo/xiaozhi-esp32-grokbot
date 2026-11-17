@@ -7,8 +7,10 @@ animation rendered through the normal LVGL display pipeline.
 ## Runtime design
 
 - 360x360, 4-bit grayscale, 30 FPS GrokBot clips.
-- Only the 28 GrokBot states used by Xiaozhi are packaged. The full 53-state
-  showcase atlas is not included.
+- Only the 39 GrokBot clips used by Xiaozhi are packaged (~5.04 MiB). Byte-identical
+  showcase duplicates (`bored`, `blocked`, `orbit`, `progress`, `dragging`,
+  `showcase`, `reading`, `coding`, `running`, `computing`, `controlling`) and thin-line
+  morphs (`bouncing`, `dictating`, `sending`) from the 53-state showcase atlas are excluded.
 - The atlas is stored in the existing 8 MiB `assets` partition, so the standard
   dual-OTA partition table remains unchanged.
 - RGB565 double buffers, packed frames and delta frames are allocated in PSRAM.
@@ -17,27 +19,53 @@ animation rendered through the normal LVGL display pipeline.
 - Animation decoding runs in a separate low-priority task on core 0. Audio and
   the application event loop are not blocked by frame decoding.
 
-## State mapping
+## State mapping & director behavior
 
-All built-in Xiaozhi emoji names are mapped to GrokBot clips. Examples:
+Built-in Xiaozhi emoji names select from weighted multi-variant GrokBot pools
+(avoiding back-to-back repeats and coalescing duplicate emotions within 2s):
 
-| Xiaozhi emotion | GrokBot state |
+| Xiaozhi emotion | GrokBot variants |
 | --- | --- |
-| neutral, relaxed | idle |
-| happy, loving, delicious | happy |
-| confident, cool | proud |
-| funny, silly, winking, kissy | playful |
-| embarrassed | shy |
-| crying, sad | sad |
-| shocked, surprised | surprised |
-| sleepy | sleeping |
-| warning | alerting |
+| neutral | clears emotion override (`idle`) |
+| relaxed | `humming`, `idle` |
+| happy | `happy`, `excited`, `celebrate`, `humming` |
+| loving | `happy`, `shy`, `humming` |
+| delicious | `happy`, `playful`, `excited` |
+| laughing | `laughing`, `excited`, `celebrate` |
+| excited | `excited`, `celebrate`, `playful` |
+| confident, cool | `proud`, `turntable`, `celebrate` |
+| funny, silly | `playful`, `laughing`, `turntable` |
+| winking, kissy | `playful`, `shy`, `happy` |
+| embarrassed | `shy`, `confused` |
+| curious | `curious`, `suspicious` |
+| thinking | `curious`, `suspicious`, `thinking` |
+| confused | `confused`, `suspicious` |
+| suspicious | `suspicious`, `curious` |
+| shocked, surprised | `surprised`, `scared`, `waking` |
+| scared | `scared`, `surprised` |
+| angry | `angry`, `suspicious` |
+| crying, sad | `sad`, `shy` |
+| sleepy | `sleeping`, `drowsy` |
+| drowsy, low_battery | `drowsy`, `powering-down` |
+| warning | `alerting` |
 
-Assistant states such as listening, thinking, speaking, connecting, searching,
-updating, notifications and failures select their corresponding GrokBot status
-clips. Internal Xiaozhi alert icons (`gear`, `cloud_download`, `download`,
-`cancel`, `cloud_off`, `link`) are mapped to loading, uploading, failed and
-approving states.
+Additional clips and mappings in the 39-clip subset:
+- `spawning`, `powering-down`: boot reveal and power-save sleep transition.
+- `humming`, `suspicious`, `celebrate`, `turntable`, `logo`: idle fidgets, easter eggs, and emotion variants.
+- `working`, `writing`: multi-stage thinking chain (`thinking` -> `working` -> `searching`/`writing`/`working`).
+- `finished`: one-shot completion transition when returning to idle after speaking (including auto-mode `streaming` -> `listening` -> `idle`) or after >=1.5s of listening.
+- `receiving`: OTA upgrade / download progress (`OTA_UPGRADE` / `UPGRADING` status, plus `cloud_download` and `download` emotions; falls back to `uploading` on older 28-clip assets).
+- `radar`: Wi-Fi scanning notification (`SCANNING_WIFI`) and radar status.
+
+`GrokBotDirector` orchestrates transitions and idle phases on cycle boundaries:
+- **Idle phases**: 0–20s post-chat afterglow (`humming`/`curious`/`happy`/`playful`),
+  20–120s exploration & easter eggs (`turntable`/`celebrate`/`logo`), 120–240s getting
+  sleepy (`drowsy`/`humming`/`shy`), 240–300s `drowsy` loop (entered on cycle boundary without interrupting active fidgets), and >=300s `sleeping` loop.
+  Minute clock status updates (`HH:MM`) do not reset the idle timer.
+- **Transitions**: Boot starts with `spawning`; waking from deep sleep/power-save plays
+  `waking`; user speech during listening starts the `thinking` -> `working` ->
+  `searching`/`writing`/`working` chain; non-neutral emotions during speaking override
+  `streaming` for 8s and return on a cycle boundary (up to 2s grace, with `idle` variants falling back to `streaming`); session end plays `finished` before returning to idle.
 
 Button 1 keeps the normal wake/chat behavior and Button 2 keeps the normal
 volume behavior. No GrokBot showcase controls are assigned to them.
@@ -60,10 +88,13 @@ python scripts/build_grokbot_subset.py \
 
 ## Assets update note
 
-The Xiaozhi OTA path updates application partitions, not the `assets`
-partition. Updating the animation therefore requires flashing the assets
-partition or the complete merged image. The display pauses animation decoding
-while Xiaozhi reports that it is loading assets.
+Normal firmware OTA only updates the application partition and does not update `grokbot.atlas`
+in the `assets` partition. Updating the atlas (e.g. upgrading from the 28-clip to the
+39-clip atlas) requires either a separate `assets` resource package update (`assets.download_url`)
+or flashing the `assets` partition (`0x800000` size) / complete merged image
+(`idf.py flash` / `esptool.py write_flash`). `GrokBotDirector` also degrades gracefully
+if run against an older 28-clip `assets` partition.
+The display pauses animation decoding while Xiaozhi reports that it is loading assets.
 
 ## Hardware validation still required
 

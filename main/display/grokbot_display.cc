@@ -22,125 +22,45 @@ constexpr int kNormalFps = 30;
 constexpr int kPowerSaveFps = 5;
 constexpr uint32_t kPanelTeHz = 60;
 
-const char* MapEmotion(const char* emotion) {
-    if (emotion == nullptr) {
-        return nullptr;
-    }
-    if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "loving") == 0 ||
-        strcmp(emotion, "delicious") == 0) {
-        return "happy";
-    }
-    if (strcmp(emotion, "laughing") == 0) {
-        return "laughing";
-    }
-    if (strcmp(emotion, "funny") == 0 || strcmp(emotion, "silly") == 0 ||
-        strcmp(emotion, "winking") == 0 || strcmp(emotion, "kissy") == 0) {
-        return "playful";
-    }
-    if (strcmp(emotion, "embarrassed") == 0) {
-        return "shy";
-    }
-    if (strcmp(emotion, "confident") == 0 || strcmp(emotion, "cool") == 0) {
-        return "proud";
-    }
-    if (strcmp(emotion, "sad") == 0 || strcmp(emotion, "crying") == 0) {
-        return "sad";
-    }
-    if (strcmp(emotion, "sleepy") == 0) {
-        return "sleeping";
-    }
-    if (strcmp(emotion, "angry") == 0) {
-        return "angry";
-    }
-    if (strcmp(emotion, "surprised") == 0 || strcmp(emotion, "shocked") == 0) {
-        return "surprised";
-    }
-    if (strcmp(emotion, "thinking") == 0) {
-        return "thinking";
-    }
-    if (strcmp(emotion, "confused") == 0) {
-        return "confused";
-    }
-    if (strcmp(emotion, "scared") == 0) {
-        return "scared";
-    }
-    if (strcmp(emotion, "warning") == 0) {
-        return "alerting";
-    }
-    if (strcmp(emotion, "gear") == 0) {
-        return "loading";
-    }
-    if (strcmp(emotion, "cloud_download") == 0 || strcmp(emotion, "download") == 0) {
-        return "uploading";
-    }
-    if (strcmp(emotion, "cancel") == 0 || strcmp(emotion, "cloud_off") == 0) {
-        return "failed";
-    }
-    if (strcmp(emotion, "link") == 0) {
-        return "approving";
-    }
-    if (strcmp(emotion, "excited") == 0) {
-        return "excited";
-    }
-    if (strcmp(emotion, "curious") == 0) {
-        return "curious";
-    }
-    if (strcmp(emotion, "drowsy") == 0 || strcmp(emotion, "low_battery") == 0) {
-        return "drowsy";
-    }
-    if (strcmp(emotion, "battery_connected") == 0) {
-        return "waking";
-    }
-    if (strcmp(emotion, "neutral") == 0 || strcmp(emotion, "robot_2") == 0 ||
-        strcmp(emotion, "relaxed") == 0 || strcmp(emotion, "idle") == 0) {
-        return "idle";
-    }
-    if (strcmp(emotion, "waking") == 0 || strcmp(emotion, "sleeping") == 0 ||
-        strcmp(emotion, "notifying") == 0) {
-        return emotion;
-    }
-    return nullptr;
-}
-
-const char* MapStatus(const char* status) {
+GrokBotDirector::StatusId MapStatus(const char* status) {
     if (status == nullptr) {
-        return "idle";
+        return GrokBotDirector::StatusId::kIdle;
     }
     if (strcmp(status, Lang::Strings::STANDBY) == 0) {
-        return "idle";
+        return GrokBotDirector::StatusId::kIdle;
     }
     if (strcmp(status, Lang::Strings::LISTENING) == 0) {
-        return "listening";
+        return GrokBotDirector::StatusId::kListening;
     }
     if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
-        return "streaming";
+        return GrokBotDirector::StatusId::kStreaming;
     }
     if (strcmp(status, Lang::Strings::CONNECTING) == 0 ||
         strcmp(status, Lang::Strings::LOADING_PROTOCOL) == 0 ||
         strcmp(status, Lang::Strings::INITIALIZING) == 0 ||
         strcmp(status, Lang::Strings::LOADING_ASSETS) == 0) {
-        return "loading";
+        return GrokBotDirector::StatusId::kLoading;
     }
     if (strcmp(status, Lang::Strings::SCANNING_WIFI) == 0) {
-        return "radar";
+        return GrokBotDirector::StatusId::kRadar;
     }
     if (strcmp(status, Lang::Strings::REGISTERING_NETWORK) == 0 ||
         strcmp(status, Lang::Strings::SERVER_NOT_FOUND) == 0) {
-        return "waiting";
+        return GrokBotDirector::StatusId::kWaiting;
     }
     if (strcmp(status, Lang::Strings::DETECTING_MODULE) == 0 ||
         strcmp(status, Lang::Strings::CHECKING_NEW_VERSION) == 0) {
-        return "searching";
+        return GrokBotDirector::StatusId::kSearching;
     }
     if (strcmp(status, Lang::Strings::ACTIVATION) == 0) {
-        return "waking";
+        return GrokBotDirector::StatusId::kWaking;
     }
     if (strcmp(status, Lang::Strings::CONNECTION_SUCCESSFUL) == 0) {
-        return "approving";
+        return GrokBotDirector::StatusId::kApproving;
     }
     if (strcmp(status, Lang::Strings::UPGRADING) == 0 ||
         strcmp(status, Lang::Strings::OTA_UPGRADE) == 0) {
-        return "uploading";
+        return GrokBotDirector::StatusId::kReceiving;
     }
     if (strcmp(status, Lang::Strings::ERROR) == 0 ||
         strcmp(status, Lang::Strings::SERVER_ERROR) == 0 ||
@@ -148,18 +68,18 @@ const char* MapStatus(const char* status) {
         strcmp(status, Lang::Strings::SERVER_NOT_CONNECTED) == 0 ||
         strcmp(status, Lang::Strings::UPGRADE_FAILED) == 0 ||
         strcmp(status, Lang::Strings::DOWNLOAD_ASSETS_FAILED) == 0) {
-        return "failed";
+        return GrokBotDirector::StatusId::kFailed;
     }
     if (strcmp(status, Lang::Strings::HELLO_MY_FRIEND) == 0) {
-        return "happy";
+        return GrokBotDirector::StatusId::kHappy;
     }
     if (strcmp(status, Lang::Strings::PLEASE_WAIT) == 0) {
-        return "waiting";
+        return GrokBotDirector::StatusId::kWaiting;
     }
     // Application::Alert() accepts a human-readable status string while the
     // animation is selected by the accompanying emotion. Do not let an unknown
     // status hide a valid emotion.
-    return "idle";
+    return GrokBotDirector::StatusId::kIdle;
 }
 }  // namespace
 
@@ -168,6 +88,7 @@ GrokbotDisplay::GrokbotDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
                                bool mirror_y, bool swap_xy, gpio_num_t te_pin)
     : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy,
                     80),
+      director_(static_cast<uint32_t>(esp_timer_get_time())),
       te_pin_(te_pin) {}
 
 GrokbotDisplay::~GrokbotDisplay() {
@@ -333,29 +254,49 @@ void GrokbotDisplay::SetupUI() {
 }
 
 bool GrokbotDisplay::SetEmotion(const char* emotion) {
-    const char* mapped = MapEmotion(emotion);
-    if (mapped == nullptr) {
-        ESP_LOGW(TAG, "Unsupported emotion: %s", emotion != nullptr ? emotion : "(null)");
-        return false;
-    }
-    requested_emotion_.store(mapped);
-    return true;
+    const int64_t now_ms = NowUs() / 1000;
+    portENTER_CRITICAL(&mailbox_mux_);
+    director_.SetNow(now_ms);
+    const bool accepted = director_.OnEmotion(emotion);
+    portEXIT_CRITICAL(&mailbox_mux_);
+    return accepted;
 }
 
 void GrokbotDisplay::SetStatus(const char* status) {
-    const bool loading_assets =
-        status != nullptr && strcmp(status, Lang::Strings::LOADING_ASSETS) == 0;
-    if (loading_assets) {
-        atlas_refresh_required_.store(true);
-    }
-    requested_status_.store(MapStatus(status));
-    assets_update_in_progress_.store(loading_assets);
+    const auto mapped = MapStatus(status);
+    const bool loading_assets = status && strcmp(status, Lang::Strings::LOADING_ASSETS) == 0;
+    const int64_t now_ms = NowUs() / 1000;
+    portENTER_CRITICAL(&mailbox_mux_);
+    director_.SetNow(now_ms);
+    director_.OnStatus(mapped);
+    if (loading_assets)
+        atlas_refresh_required_ = true;
+    assets_update_in_progress_ = loading_assets;
+    portEXIT_CRITICAL(&mailbox_mux_);
     LvglDisplay::SetStatus(status);
 }
 
+void GrokbotDisplay::SetChatMessage(const char* role, const char* content) {
+    if (role && strcmp(role, "user") == 0 && content && *content) {
+        const int64_t now_ms = NowUs() / 1000;
+        portENTER_CRITICAL(&mailbox_mux_);
+        director_.SetNow(now_ms);
+        director_.OnUserSpeech();
+        portEXIT_CRITICAL(&mailbox_mux_);
+    }
+    SpiLcdDisplay::SetChatMessage(role, content);
+}
+
 void GrokbotDisplay::ShowNotification(const char* notification, int duration_ms) {
-    const int bounded_ms = std::clamp(duration_ms, 0, 3000);
-    notification_until_us_.store(NowUs() + static_cast<int64_t>(bounded_ms) * 1000);
+    const int64_t now_ms = NowUs() / 1000;
+    const int64_t until_ms = now_ms + std::clamp(duration_ms, 0, 3000);
+    const char* clip = notification && strcmp(notification, Lang::Strings::SCANNING_WIFI) == 0
+                           ? "radar"
+                           : "notifying";
+    portENTER_CRITICAL(&mailbox_mux_);
+    director_.SetNow(now_ms);
+    director_.OnNotification(until_ms, clip);
+    portEXIT_CRITICAL(&mailbox_mux_);
     LvglDisplay::ShowNotification(notification, duration_ms);
 }
 
@@ -364,33 +305,30 @@ void GrokbotDisplay::ShowNotification(const std::string& notification, int durat
 }
 
 void GrokbotDisplay::SetPowerSaveMode(bool on) {
-    target_fps_.store(on ? kPowerSaveFps : kNormalFps);
-    LvglDisplay::SetPowerSaveMode(on);
+    const int64_t now_ms = NowUs() / 1000;
+    portENTER_CRITICAL(&mailbox_mux_);
+    director_.SetNow(now_ms);
+    director_.OnPowerSave(on);
+    power_save_ = on;
+    portEXIT_CRITICAL(&mailbox_mux_);
+    // The base implementation sets sleepy/neutral and would mask the director transition.
+    SpiLcdDisplay::SetChatMessage("system", "");
 }
 
 int64_t GrokbotDisplay::NowUs() const { return esp_timer_get_time(); }
 
-const char* GrokbotDisplay::EffectiveAnimationName() {
-    const int64_t notification_until = notification_until_us_.load();
-    const int64_t now = NowUs();
-    if (notification_until > now) {
-        return "notifying";
-    }
-    if (notification_until != 0) {
-        notification_until_us_.store(0);
-    }
-
-    const char* status = requested_status_.load();
-    if (status != nullptr && strcmp(status, "idle") != 0) {
-        return status;
-    }
-    const char* emotion = requested_emotion_.load();
-    return emotion != nullptr ? emotion : (status != nullptr ? status : "idle");
-}
-
 bool GrokbotDisplay::EnsurePlayer() {
     const int64_t now = NowUs();
-    const bool force_refresh = atlas_refresh_required_.exchange(false);
+    portENTER_CRITICAL(&mailbox_mux_);
+    const bool force_refresh = atlas_refresh_required_;
+    atlas_refresh_required_ = false;
+    portEXIT_CRITICAL(&mailbox_mux_);
+    if (force_refresh) {
+        player_ready_ = false;
+        atlas_data_ = nullptr;
+        atlas_size_ = 0;
+        has_selected_ = false;
+    }
     if (!force_refresh && player_ready_ && now < next_atlas_check_us_) {
         return true;
     }
@@ -402,19 +340,30 @@ bool GrokbotDisplay::EnsurePlayer() {
     void* ptr = nullptr;
     size_t size = 0;
     if (!Assets::GetInstance().GetAssetData(kAtlasName, ptr, size)) {
+        player_ready_ = false;
+        atlas_data_ = nullptr;
+        atlas_size_ = 0;
+        has_selected_ = false;
         ESP_LOGW(TAG, "Waiting for %s in assets partition", kAtlasName);
         return false;
     }
 
     const auto* data = static_cast<const uint8_t*>(ptr);
-    if (!player_ready_ || data != atlas_data_ || size != atlas_size_) {
-        player_ready_ = player_.init(data, size);
-        if (!player_ready_) {
+    if (force_refresh || !player_ready_ || data != atlas_data_ || size != atlas_size_) {
+        player_ready_ = false;
+        atlas_data_ = nullptr;
+        atlas_size_ = 0;
+        has_selected_ = false;
+        if (!player_.init(data, size)) {
             return false;
         }
-        atlas_data_ = data;
-        atlas_size_ = size;
-        has_selected_ = false;
+        const char* names[GrokBotPlayer::kMaxClips];
+        for (int i = 0; i < player_.clip_count(); ++i)
+            names[i] = player_.clip_name(i);
+        const uint64_t available = GrokBotDirector::AvailabilityMask(names, player_.clip_count());
+        portENTER_CRITICAL(&mailbox_mux_);
+        director_.SetAvailable(available);
+        portEXIT_CRITICAL(&mailbox_mux_);
         const int new_packed_size = player_.width() * player_.height() / 2;
         const size_t new_image_size = static_cast<size_t>(player_.width()) * player_.height() * 2;
         if (new_packed_size <= 0 || new_image_size == 0) {
@@ -504,6 +453,9 @@ bool GrokbotDisplay::EnsurePlayer() {
                 image_descs_[i].data = reinterpret_cast<const uint8_t*>(image_buffers_[i]);
             }
         }
+        atlas_data_ = data;
+        atlas_size_ = size;
+        player_ready_ = true;
         ESP_LOGI(TAG, "Atlas ready: %dx%d, %d states, %d fps, packed=%u image=%u", frame_width_,
                  frame_height_, player_.clip_count(), player_.fps(),
                  static_cast<unsigned>(packed_size_), static_cast<unsigned>(image_size_));
@@ -543,6 +495,9 @@ bool GrokbotDisplay::DecodeFrame(const GrokBotPlayer::FrameInfo& frame, bool exp
         for (size_t i = 0; i < word_count; ++i) {
             packed_words[i] ^= delta_words[i];
         }
+        for (size_t i = word_count * sizeof(uint32_t); i < packed_size_; ++i) {
+            packed_[i] ^= delta_[i];
+        }
     }
     if (expand) {
         ExpandPackedFrame();
@@ -570,11 +525,11 @@ bool GrokbotDisplay::PresentFrame() {
     WaitForTeFrame(std::max(1, target_fps_.load()));
     const int64_t start_us = NowUs();
     const int presented = write_buffer_;
-    write_buffer_ ^= 1;
     DisplayLockGuard lock(this);
     if (!lock) {
         return false;
     }
+    write_buffer_ ^= 1;
     lv_image_set_src(emoji_image_, &image_descs_[presented]);
     lv_obj_remove_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
     present_us_total_ += NowUs() - start_us;
@@ -583,24 +538,23 @@ bool GrokbotDisplay::PresentFrame() {
 
 bool GrokbotDisplay::RebuildCurrentFrame() {
     const int target = player_.current_index();
-    if (!player_.seek(0)) {
-        return false;
-    }
-    for (int i = 0; i <= target; ++i) {
-        GrokBotPlayer::FrameInfo frame = {};
-        if (!player_.frame_info(i, &frame) || !DecodeFrame(frame, i == target)) {
+    GrokBotPlayer::FrameInfo frame = {};
+    int key = target;
+    while (key > 0) {
+        if (!player_.frame_info(key, &frame))
             return false;
-        }
+        if (!frame.delta)
+            break;
+        --key;
     }
-    if (!player_.seek(target)) {
-        return false;
+    packed_index_ = -1;
+    for (int i = key; i <= target; ++i) {
+        if (!player_.frame_info(i, &frame) || (i == key && frame.delta) ||
+            !DecodeFrame(frame, i == target))
+            return false;
+        packed_index_ = i;
     }
-    rebuild_pending_ = false;
-    if (!PresentFrame()) {
-        return false;
-    }
-    player_.advance();
-    return true;
+    return PresentFrame();
 }
 
 void GrokbotDisplay::AnimationTaskEntry(void* arg) {
@@ -614,8 +568,15 @@ void GrokbotDisplay::AnimationTask() {
     int64_t render_total_us = 0;
     uint32_t last_report_te_edges = te_edge_count_.load(std::memory_order_relaxed);
     uint32_t rendered_frames = 0;
+    GrokBotDirector::Directive directive{nullptr, GrokBotDirector::PlayMode::kLoopPingPong, 0, 0};
+    GrokBotDirector::ClipEvent pending_event = GrokBotDirector::ClipEvent::kCycleBoundary;
+    bool event_pending = false;
+    bool once_done = false;
     while (running_.load()) {
-        if (assets_update_in_progress_.load()) {
+        portENTER_CRITICAL(&mailbox_mux_);
+        bool paused = assets_update_in_progress_;
+        portEXIT_CRITICAL(&mailbox_mux_);
+        if (paused) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -624,64 +585,86 @@ void GrokbotDisplay::AnimationTask() {
             continue;
         }
 
-        const int fps = std::max(1, target_fps_.load());
+        const int64_t now_ms = NowUs() / 1000;
+        portENTER_CRITICAL(&mailbox_mux_);
+        paused = assets_update_in_progress_;
+        director_.SetNow(now_ms);
+        if (!paused && has_selected_ && event_pending)
+            director_.OnClipEvent(pending_event);
+        const auto next = paused ? directive : director_.Step(now_ms);
+        const bool power_save = power_save_;
+        portEXIT_CRITICAL(&mailbox_mux_);
+        if (paused) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        event_pending = false;
+        if (!has_selected_ || next.seq != directive.seq) {
+            if (!next.clip || !player_.select_name(next.clip)) {
+                vTaskDelay(pdMS_TO_TICKS(250));
+                continue;
+            }
+            directive = next;
+            const int upper =
+                GrokBotFrameUpper(player_.selected_frame_count(), directive.max_frames);
+            player_.seek(GrokBotFrameLower(player_.start_frame(), upper));
+            reverse_ = false;
+            has_selected_ = true;
+            packed_index_ = -1;
+            once_done = false;
+            ESP_LOGI(TAG, "Animation -> %s", directive.clip);
+        }
+        const int fps =
+            power_save && strcmp(directive.clip, "sleeping") == 0 ? kPowerSaveFps : kNormalFps;
+        target_fps_.store(fps);
         const int64_t frame_us = 1000000LL / fps;
-        const char* effective = EffectiveAnimationName();
-        if (!has_selected_ || strcmp(player_.selected_name(), effective) != 0) {
-            if (player_.select_name(effective)) {
-                player_.seek(player_.start_frame());
-                reverse_ = false;
-                rebuild_pending_ = true;
-                has_selected_ = true;
-                ESP_LOGI(TAG, "Animation -> %s", effective);
-            } else {
-                player_.select_name("idle");
-                player_.seek(player_.start_frame());
-                reverse_ = false;
-                rebuild_pending_ = true;
-                has_selected_ = true;
-                ESP_LOGW(TAG, "Animation fallback -> idle");
-            }
+        if (once_done) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
-
         const int64_t render_start_us = NowUs();
+        const int target = player_.current_index();
+        GrokBotPlayer::FrameInfo frame = {};
+        // D[i] reverses P[i] to P[i-1]; a reverse key frame needs reconstruction.
+        const int source = reverse_ ? packed_index_ : target;
+        const bool source_valid = player_.frame_info(source, &frame);
+        auto action = GrokBotPlanFrame(packed_index_, target, reverse_, frame.delta);
+        if (action != GrokBotFrameAction::kPresent && !source_valid)
+            action = GrokBotFrameAction::kRebuild;
         bool rendered = false;
-        if (rebuild_pending_) {
-            rendered = RebuildCurrentFrame();
-        } else if (!reverse_) {
-            GrokBotPlayer::FrameInfo frame = {};
-            rendered = player_.current_frame(&frame) && DecodeFrame(frame, true) && PresentFrame();
-            const int count = player_.selected_frame_count();
-            if (player_.current_index() + 1 >= count) {
-                reverse_ = true;
-            } else {
-                player_.advance();
-            }
-        } else {
-            const int lower = player_.start_frame();
-            if (player_.current_index() <= lower) {
-                reverse_ = false;
-                if (player_.current_index() + 1 < player_.selected_frame_count()) {
-                    player_.seek(player_.current_index() + 1);
-                }
-                GrokBotPlayer::FrameInfo frame = {};
-                rendered =
-                    player_.current_frame(&frame) && DecodeFrame(frame, true) && PresentFrame();
-                player_.advance();
-            } else {
-                GrokBotPlayer::FrameInfo frame = {};
-                if (player_.current_frame(&frame) && DecodeFrame(frame, false)) {
-                    ExpandPackedFrame();
+        switch (action) {
+            case GrokBotFrameAction::kPresent:
+                ExpandPackedFrame();
+                rendered = PresentFrame();
+                break;
+            case GrokBotFrameAction::kDecode:
+                if (DecodeFrame(frame, true)) {
+                    packed_index_ = target;
                     rendered = PresentFrame();
-                    player_.retreat();
                 }
-            }
+                break;
+            case GrokBotFrameAction::kRebuild:
+                rendered = RebuildCurrentFrame();
+                break;
         }
-
         if (!rendered) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        const int upper = GrokBotFrameUpper(player_.selected_frame_count(), directive.max_frames);
+        const int lower = GrokBotFrameLower(player_.start_frame(), upper);
+        const auto step =
+            GrokBotNextFrame(target, reverse_, lower, upper,
+                             directive.mode == GrokBotDirector::PlayMode::kLoopPingPong,
+                             directive.mode == GrokBotDirector::PlayMode::kOnceForward);
+        if (step.cycle_boundary || step.once_done) {
+            pending_event = step.once_done ? GrokBotDirector::ClipEvent::kOnceDone
+                                           : GrokBotDirector::ClipEvent::kCycleBoundary;
+            event_pending = true;
+        }
+        once_done = step.once_done;
+        reverse_ = step.reverse;
+        player_.seek(step.index);
         render_total_us += NowUs() - render_start_us;
         ++rendered_frames;
 

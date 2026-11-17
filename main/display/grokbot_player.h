@@ -3,6 +3,49 @@
 #include <cstddef>
 #include <cstdint>
 
+enum class GrokBotFrameAction { kPresent, kDecode, kRebuild };
+
+inline GrokBotFrameAction GrokBotPlanFrame(int packed_index, int target, bool reverse,
+                                           bool source_delta) {
+    if (packed_index == target) {
+        return GrokBotFrameAction::kPresent;
+    }
+    if (reverse ? packed_index == target + 1 && source_delta
+                : !source_delta || (packed_index >= 0 && packed_index == target - 1)) {
+        return GrokBotFrameAction::kDecode;
+    }
+    return GrokBotFrameAction::kRebuild;
+}
+
+inline int GrokBotFrameUpper(int frame_count, uint16_t max_frames) {
+    return (max_frames && max_frames < frame_count ? max_frames : frame_count) - 1;
+}
+
+inline int GrokBotFrameLower(int start_frame, int upper) {
+    return start_frame < upper ? start_frame : upper;
+}
+
+struct GrokBotFrameStep {
+    int index;
+    bool reverse;
+    bool cycle_boundary = false;
+    bool once_done = false;
+};
+
+inline GrokBotFrameStep GrokBotNextFrame(int target, bool reverse, int lower, int upper, bool loop,
+                                         bool forward_only) {
+    if (forward_only && target >= upper) {
+        return {target, reverse, false, true};
+    }
+    if (upper == lower || (reverse && target <= lower)) {
+        return {lower < upper ? lower + 1 : lower, false, loop, !loop};
+    }
+    if (!reverse && target >= upper) {
+        return {target - 1, true, loop, false};
+    }
+    return {target + (reverse ? -1 : 1), reverse};
+}
+
 class GrokBotPlayer {
 public:
     static constexpr int kMaxClips = 64;
