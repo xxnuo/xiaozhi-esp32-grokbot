@@ -1,5 +1,7 @@
 #include "grokbot_display.h"
 
+#include "grokbot_caption.h"
+
 #include "application.h"
 #include "assets.h"
 #include "assets/lang_config.h"
@@ -415,6 +417,12 @@ bool GrokbotDisplay::OnInteraction(const char* emotion) {
 }
 
 void GrokbotDisplay::SetStatus(const char* status) {
+    DisplayLockGuard lock(this);
+    if (!lock)
+        return;
+    show_expression_caption_ = status && (strcmp(status, Lang::Strings::STANDBY) == 0 ||
+                                          strcmp(status, Lang::Strings::LISTENING) == 0 ||
+                                          strcmp(status, Lang::Strings::SPEAKING) == 0);
     const auto mapped = MapStatus(status);
     const bool loading_assets = status && strcmp(status, Lang::Strings::LOADING_ASSETS) == 0;
     const int64_t now_ms = NowUs() / 1000;
@@ -425,7 +433,7 @@ void GrokbotDisplay::SetStatus(const char* status) {
         atlas_refresh_required_ = true;
     assets_update_in_progress_ = loading_assets;
     portEXIT_CRITICAL(&mailbox_mux_);
-    LvglDisplay::SetStatus(status);
+    LvglDisplay::SetStatus(show_expression_caption_ ? expression_caption_ : status);
 }
 
 void GrokbotDisplay::SetChatMessage(const char* role, const char* content) {
@@ -744,6 +752,12 @@ bool GrokbotDisplay::PresentFrame() {
         if (!lock) {
             xSemaphoreGive(refresh_ready_);
             return false;
+        }
+        const char* caption = GrokBotCaption(player_.selected_name());
+        if (expression_caption_ != caption) {
+            expression_caption_ = caption;
+            if (show_expression_caption_ && status_label_)
+                lv_label_set_text(status_label_, caption);
         }
         pipeline_.Complete();
         const int presented = pipeline_.Submit();

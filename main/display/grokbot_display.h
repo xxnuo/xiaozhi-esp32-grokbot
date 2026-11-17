@@ -57,6 +57,9 @@ private:
     portMUX_TYPE mailbox_mux_ = portMUX_INITIALIZER_UNLOCKED;
     GrokBotDirector director_;
     GrokBotFace face_;
+    // Protected by the display lock, like the status label.
+    const char* expression_caption_ = "Hello there!";
+    bool show_expression_caption_ = false;
     int64_t face_exit_until_ = 0;
     bool assets_update_in_progress_ = false;
     bool atlas_refresh_required_ = false;
