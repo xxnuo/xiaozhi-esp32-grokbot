@@ -73,6 +73,7 @@ class M5StackStopwatchGrokbotBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     M5PM1 pmic_;
+    bool pmic_ready_ = false;
     M5IOE1 ioe_;
     Button button1_;
     Button button2_;
@@ -113,13 +114,51 @@ private:
         });
     }
 
+    bool ConfigurePowerButton() {
+        if (!pmic_ready_)
+            return false;
+        if (pmic_.irqClearBtnAll() != M5PM1_OK ||
+            pmic_.irqSetBtnMask(M5PM1_IRQ_BTN_CLICK, M5PM1_IRQ_MASK_DISABLE) != M5PM1_OK ||
+            pmic_.irqSetBtnMask(M5PM1_IRQ_BTN_DOUBLE, M5PM1_IRQ_MASK_DISABLE) != M5PM1_OK ||
+            pmic_.setSingleResetDisable(true) != M5PM1_OK) {
+            ESP_LOGW(TAG, "Could not configure power button events");
+            return false;
+        }
+        if (pmic_.setDoubleOffDisable(true) != M5PM1_OK) {
+            pmic_.setSingleResetDisable(false);
+            ESP_LOGW(TAG, "Could not defer hardware shutdown");
+            return false;
+        }
+        ESP_LOGI(TAG, "Power button shutdown notice enabled");
+        return true;
+    }
+
     void InputTask() {
         GrokbotInputs inputs;
+        const bool power_button = ConfigurePowerButton();
+        int64_t shutdown_at_ms = 0;
         unsigned imu_failures = 0;
         bool touch_seen = false;
         bool imu_sample_seen = false;
         while (true) {
             const int64_t now_ms = esp_timer_get_time() / 1000;
+            if (power_button) {
+                if (shutdown_at_ms && now_ms >= shutdown_at_ms) {
+                    if (pmic_.shutdown() != M5PM1_OK) {
+                        ESP_LOGW(TAG, "Power button shutdown request failed");
+                        display_->ShowNotification(display_->IsChinese() ? "关机失败" : "Shutdown failed");
+                    }
+                    shutdown_at_ms = 0;
+                } else if (!shutdown_at_ms) {
+                    uint8_t events = 0;
+                    if (pmic_.irqGetBtnStatus(&events, M5PM1_CLEAN_ONCE) == M5PM1_OK &&
+                        (events & (M5PM1_IRQ_BTN_CLICK | M5PM1_IRQ_BTN_DOUBLE))) {
+                        ESP_LOGI(TAG, "Power button event: 0x%02x", events);
+                        display_->ShowShutdownNotice();
+                        shutdown_at_ms = esp_timer_get_time() / 1000 + 1000;
+                    }
+                }
+            }
             if (touch_) {
                 // CST820B may NACK while asleep, just like M5GFX's CST816S driver.
                 // Probe first so an absent/sleeping controller does not flood I2C error logs.
@@ -248,7 +287,7 @@ private:
     }
 
     void InitializeInputTask() {
-        if ((touch_ || imu_) &&
+        if ((touch_ || imu_ || pmic_ready_) &&
             xTaskCreate(
                 [](void* arg) { static_cast<M5StackStopwatchGrokbotBoard*>(arg)->InputTask(); },
                 "grokbot_inputs", 4096, this, 1, nullptr) != pdPASS) {
@@ -280,6 +319,7 @@ private:
             return;
         }
 
+        pmic_ready_ = true;
         pmic_.setChargeEnable(true);
         pmic_.setBoostEnable(true);
         pmic_.pinMode(PMIC_PIN_CHARGE_STATE, INPUT);

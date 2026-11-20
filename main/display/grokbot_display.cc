@@ -791,6 +791,12 @@ void GrokbotDisplay::SetChatMessage(const char* role, const char* content) {
     SpiLcdDisplay::SetChatMessage(role, content);
 }
 
+void GrokbotDisplay::ShowShutdownNotice() {
+    ShowNotification(IsChinese() ? "正在关机..." : "Shutting down...", 2000);
+    if (refresh_task_)
+        xTaskNotifyGive(refresh_task_);
+}
+
 void GrokbotDisplay::ShowNotification(const char* notification, int duration_ms) {
     const int64_t now_ms = NowUs() / 1000;
     const int64_t until_ms = now_ms + std::clamp(duration_ms, 0, 3000);
