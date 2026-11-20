@@ -101,12 +101,23 @@ GrokBotDirector::StatusId MapStatus(const char* status) {
 }  // namespace
 
 GrokbotDisplay::GrokbotDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
-                               int width, int height, int offset_x, int offset_y, bool mirror_x,
-                               bool mirror_y, bool swap_xy, gpio_num_t te_pin)
-    : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy,
-                    80),
+                               int width, int height, int offset_x, int offset_y,
+                               lv_display_rotation_t rotation, gpio_num_t te_pin)
+    : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, false, false, false,
+                    rotation % 2 ? 40 : 80, rotation % 2 != 0),
       director_(static_cast<uint32_t>(esp_timer_get_time())),
-      te_pin_(te_pin) {
+      te_pin_(te_pin),
+      reverse_flush_(rotation == LV_DISPLAY_ROTATION_180) {
+    if (display_ && rotation != LV_DISPLAY_ROTATION_0) {
+        DisplayLockGuard lock(this);
+        if (lock && reverse_flush_) {
+            // esp_lvgl_port swaps the dimensions of a 180-degree RGB565 strip.
+            lv_display_set_user_data(display_, this);
+            lv_display_set_flush_cb(display_, ReverseFlush);
+        } else if (lock) {
+            lv_display_set_rotation(display_, rotation);
+        }
+    }
     show_idle_clock_ = false;
     Settings display_settings("display", false);
     language_zh_.store(display_settings.GetInt("lang", 0) == 0, std::memory_order_relaxed);
@@ -277,6 +288,27 @@ void GrokbotDisplay::CheckStripTransfer(uint32_t completed_us) {
     refresh_tear_risk_ |= first != last || first != refresh_scan_cycle_;
 }
 
+lv_area_t GrokbotDisplay::ReverseArea(const lv_area_t& area) const {
+    return {width_ - 1 - area.x2, height_ - 1 - area.y2,
+            width_ - 1 - area.x1, height_ - 1 - area.y1};
+}
+
+void GrokbotDisplay::ReverseFlush(lv_display_t* display, const lv_area_t* area, uint8_t* px_map) {
+    auto* self = static_cast<GrokbotDisplay*>(lv_display_get_user_data(display));
+    auto* pixels = reinterpret_cast<uint16_t*>(px_map);
+    const auto count = lv_area_get_size(area);
+    // Partial-mode RGB565 rows are tightly packed on StopWatch.
+    std::reverse(pixels, pixels + count);
+    lv_draw_sw_rgb565_swap(pixels, count);
+    const auto target = self->ReverseArea(*area);
+    const auto err = esp_lcd_panel_draw_bitmap(self->panel_, target.x1, target.y1,
+                                              target.x2 + 1, target.y2 + 1, pixels);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to flush reversed strip: %s", esp_err_to_name(err));
+        lv_display_flush_ready(display);
+    }
+}
+
 void GrokbotDisplay::RefreshEventCb(lv_event_t* event) {
     auto* self = static_cast<GrokbotDisplay*>(lv_event_get_user_data(event));
     if (lv_event_get_code(event) == LV_EVENT_REFR_START) {
@@ -308,7 +340,11 @@ void GrokbotDisplay::RefreshEventCb(lv_event_t* event) {
                 }
             }
         }
-        const auto* area = static_cast<lv_area_t*>(lv_event_get_param(event));
+        auto area = *static_cast<const lv_area_t*>(lv_event_get_param(event));
+        if (self->reverse_flush_)
+            area = self->ReverseArea(area);
+        else
+            lv_display_rotate_area(self->display_, &area);
         const uint32_t now = self->NowUs();
         if (first_strip) {
             self->frame_transfer_start_us_.store(now, std::memory_order_relaxed);
@@ -316,10 +352,10 @@ void GrokbotDisplay::RefreshEventCb(lv_event_t* event) {
             self->refresh_te_us_ = self->te_timestamp_.load();
             self->refresh_period_us_ = self->te_period_us_.load();
             self->refresh_scan_cycle_ =
-                ScanCycle(static_cast<int32_t>(now - self->refresh_te_us_), area->y1,
+                ScanCycle(static_cast<int32_t>(now - self->refresh_te_us_), area.y1,
                           self->refresh_period_us_, self->height_);
         }
-        self->strip_area_ = *area;
+        self->strip_area_ = area;
         self->strip_start_us_ = now;
         self->strip_last_ = lv_display_flush_is_last(self->display_);
     } else if (lv_event_get_code(event) == LV_EVENT_REFR_READY) {

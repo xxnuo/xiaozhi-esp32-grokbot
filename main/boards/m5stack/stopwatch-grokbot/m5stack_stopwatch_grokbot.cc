@@ -1,6 +1,5 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
-#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <ssid_manager.h>
@@ -497,35 +496,19 @@ private:
         panel_config.vendor_config = &vendor_config;
         ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(panel_io, &panel_config, &panel));
 
-        const bool swap = boot_orientation_ % 2 != 0;
-        const bool mirror_x = boot_orientation_ == 1 || boot_orientation_ == 2;
-        const bool mirror_y = boot_orientation_ >= 2;
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, false);
-        ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, swap));
-        ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, mirror_x, mirror_y));
-        if (boot_orientation_ != 0) {
-            // The round viewport can expose GRAM outside the LVGL draw window.
-            constexpr int kGramSize = 480;
-            constexpr int kClearRows = 16;
-            auto* black = heap_caps_calloc(kGramSize * kClearRows, sizeof(uint16_t),
-                                          MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-            ESP_ERROR_CHECK(black ? ESP_OK : ESP_ERR_NO_MEM);
-            ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, false));
-            for (int y = 0; y < kGramSize; y += kClearRows) {
-                ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, y, kGramSize, y + kClearRows,
-                                                         black));
-            }
-            // The command waits for the queued SPI color transfer before freeing its buffer.
-            ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
-            heap_caps_free(black);
-        }
-        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, swap ? 0 : 6, swap ? 6 : 0));
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, 6, 0));
 
+        // LVGL's display rotation is counterclockwise; boot orientation is clockwise.
+        constexpr lv_display_rotation_t rotations[] = {
+            LV_DISPLAY_ROTATION_0, LV_DISPLAY_ROTATION_270,
+            LV_DISPLAY_ROTATION_180, LV_DISPLAY_ROTATION_90,
+        };
         display_ = new GrokbotDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
-                                      DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, mirror_x,
-                                      mirror_y, swap, DISPLAY_TE_PIN);
+                                      DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
+                                      rotations[boot_orientation_], DISPLAY_TE_PIN);
         display_->SetSettingsCallbacks(
             []() {
                 std::vector<std::string> names;

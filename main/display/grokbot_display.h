@@ -23,8 +23,8 @@ public:
     static constexpr uint16_t kTeScanline = 128;
 
     GrokbotDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
-                   int height, int offset_x, int offset_y, bool mirror_x, bool mirror_y,
-                   bool swap_xy, gpio_num_t te_pin = GPIO_NUM_NC);
+                   int height, int offset_x, int offset_y, lv_display_rotation_t rotation,
+                   gpio_num_t te_pin = GPIO_NUM_NC);
     ~GrokbotDisplay() override;
 
     void SetupUI() override;
@@ -55,6 +55,8 @@ private:
     static void AnimationTaskEntry(void* arg);
     static void RefreshTaskEntry(void* arg);
     static void TeIsr(void* arg);
+    lv_area_t ReverseArea(const lv_area_t& area) const;
+    static void ReverseFlush(lv_display_t* display, const lv_area_t* area, uint8_t* px_map);
     static void RefreshEventCb(lv_event_t* event);
     static bool TransferDone(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t* event,
                              void* arg);
@@ -171,6 +173,7 @@ private:
     bool has_selected_ = false;
     int packed_index_ = -1;
     gpio_num_t te_pin_ = GPIO_NUM_NC;
+    const bool reverse_flush_;
     SemaphoreHandle_t te_semaphore_ = nullptr;
     bool te_isr_installed_ = false;
     std::atomic<uint32_t> te_timeout_count_{0};
