@@ -117,9 +117,8 @@ private:
     bool ConfigurePowerButton() {
         if (!pmic_ready_)
             return false;
-        if (pmic_.irqClearBtnAll() != M5PM1_OK ||
-            pmic_.irqSetBtnMask(M5PM1_IRQ_BTN_CLICK, M5PM1_IRQ_MASK_DISABLE) != M5PM1_OK ||
-            pmic_.irqSetBtnMask(M5PM1_IRQ_BTN_DOUBLE, M5PM1_IRQ_MASK_DISABLE) != M5PM1_OK ||
+        bool was_pressed = false;
+        if (pmic_.btnGetFlag(&was_pressed) != M5PM1_OK ||
             pmic_.setSingleResetDisable(true) != M5PM1_OK) {
             ESP_LOGW(TAG, "Could not configure power button events");
             return false;
@@ -137,6 +136,7 @@ private:
         GrokbotInputs inputs;
         const bool power_button = ConfigurePowerButton();
         int64_t shutdown_at_ms = 0;
+        bool power_press_pending = false;
         unsigned imu_failures = 0;
         bool touch_seen = false;
         bool imu_sample_seen = false;
@@ -150,10 +150,18 @@ private:
                     }
                     shutdown_at_ms = 0;
                 } else if (!shutdown_at_ms) {
-                    uint8_t events = 0;
-                    if (pmic_.irqGetBtnStatus(&events, M5PM1_CLEAN_ONCE) == M5PM1_OK &&
-                        (events & (M5PM1_IRQ_BTN_CLICK | M5PM1_IRQ_BTN_DOUBLE))) {
-                        ESP_LOGI(TAG, "Power button event: 0x%02x", events);
+                    bool pressed = false;
+                    bool was_pressed = false;
+                    // Read the latched press even if it started and ended between polls.
+                    if (pmic_.btnGetState(&pressed) == M5PM1_OK &&
+                        pmic_.btnGetFlag(&was_pressed) == M5PM1_OK) {
+                        power_press_pending |= pressed || was_pressed;
+                    } else {
+                        pressed = true;
+                    }
+                    if (power_press_pending && !pressed) {
+                        power_press_pending = false;
+                        ESP_LOGI(TAG, "Power button released; showing shutdown notice");
                         display_->ShowShutdownNotice();
                         shutdown_at_ms = esp_timer_get_time() / 1000 + 1000;
                     }
