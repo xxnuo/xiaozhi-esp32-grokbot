@@ -791,8 +791,11 @@ void GrokbotDisplay::SetChatMessage(const char* role, const char* content) {
     SpiLcdDisplay::SetChatMessage(role, content);
 }
 
-void GrokbotDisplay::ShowShutdownNotice() {
-    ShowNotification(IsChinese() ? "正在关机..." : "Shutting down...", 2000);
+void GrokbotDisplay::ShowShutdownNotice(bool confirmed) {
+    const bool zh = IsChinese();
+    ShowNotification(confirmed ? (zh ? "正在关机..." : "Shutting down...")
+                               : (zh ? "再按一次确认关机" : "Press again to shut down"),
+                     confirmed ? 2000 : 3000);
     if (refresh_task_)
         xTaskNotifyGive(refresh_task_);
 }

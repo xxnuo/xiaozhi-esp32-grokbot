@@ -45,7 +45,7 @@ public:
                               std::function<void()> enter_wifi_config);
     void SetStatus(const char* status) override;
     void SetChatMessage(const char* role, const char* content) override;
-    void ShowShutdownNotice();
+    void ShowShutdownNotice(bool confirmed);
     void ShowNotification(const char* notification, int duration_ms = 3000) override;
     void ShowNotification(const std::string& notification, int duration_ms = 3000) override;
     void SetPowerSaveMode(bool on) override;
