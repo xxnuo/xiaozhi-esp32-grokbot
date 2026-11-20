@@ -427,9 +427,8 @@ private:
         const bool swap = boot_orientation_ % 2 != 0;
         const bool mirror_x = boot_orientation_ == 1 || boot_orientation_ == 2;
         const bool mirror_y = boot_orientation_ >= 2;
-        const int x_gap = mirror_x ? 8 : 6;
-        const int y_gap = mirror_y ? 14 : 0;
-        esp_lcd_panel_set_gap(panel, swap ? y_gap : x_gap, swap ? x_gap : y_gap);
+        // CO5300 keeps its GRAM origin on mirror; MV only exchanges the axes.
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, swap ? 0 : 6, swap ? 6 : 0));
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, false);
