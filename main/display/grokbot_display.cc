@@ -614,10 +614,12 @@ void GrokbotDisplay::ExecuteMenuItem(int index) {
                 Settings settings("display", true);
                 settings.SetBool("boot_orient", item.param != 0);
             }
-            DisplayLockGuard lock(this);
-            if (lock)
-                RebuildSettingsMenuLocked();
-            menu_idle_at_us_.store(NowUs() + 15000000LL, std::memory_order_relaxed);
+            CloseSettingsMenu();
+            const bool zh = IsChinese();
+            ShowNotification(item.param
+                                 ? (zh ? "侧立或倒立重启，按90°定向" : "Restart sideways or upside down")
+                                 : (zh ? "重启后恢复默认方向" : "Default orientation after reboot"),
+                             4000);
             break;
         }
         case MenuAction::kWifiSelect:

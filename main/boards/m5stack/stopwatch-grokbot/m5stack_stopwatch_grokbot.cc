@@ -327,13 +327,26 @@ private:
     void ReadBootOrientation() {
         if (!imu_ || !Settings("display").GetBool("boot_orient"))
             return;
-        // BMI270 runs at 25 Hz. Wait for its filtered output to settle.
-        vTaskDelay(pdMS_TO_TICKS(160));
-        bmi2_sens_data sample = {};
-        if (bmi2_get_sensor_data(&sample, imu_) == BMI2_OK) {
-            boot_orientation_ = BootOrientation(sample.acc.x, sample.acc.y, sample.acc.z);
+        // Require two matching fresh readings at the 25 Hz sensor rate.
+        int previous = -1;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            bmi2_sens_data sample = {};
+            if (bmi2_get_sensor_data(&sample, imu_) != BMI2_OK ||
+                !(sample.status & BMI2_DRDY_ACC)) {
+                previous = -1;
+                continue;
+            }
+            const int orientation = BootOrientation(sample.acc.x, sample.acc.y, sample.acc.z);
+            if (orientation >= 0 && orientation == previous) {
+                boot_orientation_ = orientation;
+                ESP_LOGI(TAG, "Boot orientation: %d degrees (x=%d y=%d z=%d raw)",
+                         orientation * 90, sample.acc.x, sample.acc.y, sample.acc.z);
+                return;
+            }
+            previous = orientation;
         }
-        ESP_LOGI(TAG, "Boot orientation: %d degrees", boot_orientation_ * 90);
+        ESP_LOGW(TAG, "Boot orientation: no stable tilted sample; using default");
     }
 
     void InitializeDisplay() {

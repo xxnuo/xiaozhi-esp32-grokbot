@@ -7,11 +7,12 @@ using Reaction = GrokbotInputs::Reaction;
 
 static void TestRotation() {
     assert(BootOrientation(-8192, 0, 0) == 0);
+    assert(BootOrientation(-6906, 3080, 2875) == 0);
     assert(BootOrientation(0, 8192, 0) == 1);
     assert(BootOrientation(8192, 0, 0) == 2);
     assert(BootOrientation(0, -8192, 0) == 3);
-    assert(BootOrientation(0, 0, 8192) == 0);
-    assert(BootOrientation(0, 16000, 0) == 0);
+    assert(BootOrientation(0, 0, 8192) == -1);
+    assert(BootOrientation(0, 16000, 0) == -1);
     const int physical[][2] = {{10, 20}, {445, 10}, {455, 445}, {20, 455}};
     for (int orientation = 0; orientation < 4; ++orientation) {
         int x = physical[orientation][0];

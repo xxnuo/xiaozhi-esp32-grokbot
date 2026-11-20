@@ -10,7 +10,7 @@ inline int BootOrientation(int x, int y, int z) {
     const int64_t total = planar + int64_t(z) * z;
     // At +/-4 g, 8192 counts equal 1 g.
     if (total < 6554LL * 6554 || total > 9830LL * 9830 || planar < 2867LL * 2867)
-        return 0;
+        return -1;
     if (std::abs(x) >= std::abs(y))
         return x < 0 ? 0 : 2;
     return y > 0 ? 1 : 3;
