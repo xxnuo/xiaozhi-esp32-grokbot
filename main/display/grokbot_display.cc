@@ -115,6 +115,8 @@ GrokbotDisplay::~GrokbotDisplay() {
         DisplayLockGuard lock(this);
         if (lock && display_) {
             lv_display_remove_event_cb_with_user_data(display_, RefreshEventCb, this);
+            if (rotation_canvas_)
+                lv_timer_pause(lv_display_get_refr_timer(display_));
             if (emoji_image_)
                 lv_image_set_src(emoji_image_, nullptr);
         }
@@ -135,6 +137,9 @@ GrokbotDisplay::~GrokbotDisplay() {
         vSemaphoreDelete(te_semaphore_);
         te_semaphore_ = nullptr;
     }
+    heap_caps_free(rotation_canvas_);
+    if (strip_done_)
+        vSemaphoreDelete(strip_done_);
     heap_caps_free(start_frames_);
     heap_caps_free(retired_image_);
     heap_caps_free(displayed_packed_);
@@ -233,6 +238,11 @@ bool GrokbotDisplay::TransferDone(esp_lcd_panel_io_handle_t io,
                                            maximum, elapsed_us, std::memory_order_relaxed)) {
         }
     }
+    if (self->strip_done_) {
+        BaseType_t wake = pdFALSE;
+        xSemaphoreGiveFromISR(self->strip_done_, &wake);
+        return wake == pdTRUE;
+    }
     lv_display_flush_ready(self->display_);
     return false;
 }
@@ -279,52 +289,172 @@ void GrokbotDisplay::RefreshEventCb(lv_event_t* event) {
     if (lv_event_get_code(event) == LV_EVENT_REFR_START) {
         self->refreshing_frame_ = self->refresh_pending_.exchange(false);
         self->awaiting_te_ = true;
-    } else if (lv_event_get_code(event) == LV_EVENT_FLUSH_START) {
-        const bool first_strip = self->awaiting_te_;
-        if (first_strip) {
-            self->awaiting_te_ = false;
-            // Every flush waits under the LVGL lock; low-fps pacing happened before submission.
-            const int sync_fps = self->refreshing_frame_ && self->refresh_fps_ >= kNormalFps
-                                     ? self->refresh_fps_
-                                     : kPanelTeHz;
-            self->WaitForTeFrame(sync_fps, self->refreshing_frame_);
-            if (self->refreshing_frame_) {
-                const int64_t now = self->NowUs();
-                const int64_t previous = self->last_present_us_.exchange(now);
-                if (previous) {
-                    portENTER_CRITICAL(&self->mailbox_mux_);
-                    const uint32_t interval = now - previous;
-                    self->te_lag_max_us_ = std::max(
-                        self->te_lag_max_us_,
-                        uint32_t(now) - self->te_timestamp_.load(std::memory_order_relaxed));
-                    if (self->interval_count_ < 256)
-                        self->frame_intervals_[self->interval_count_++] = interval;
-                    if (interval > 40000)
-                        ++self->slow_frames_;
-                    portEXIT_CRITICAL(&self->mailbox_mux_);
-                }
-            }
-        }
+        self->rotation_dirty_ = {self->width_, self->height_, -1, -1};
+    } else if (lv_event_get_code(event) == LV_EVENT_FLUSH_START && !self->rotation_canvas_) {
         const auto* area = static_cast<lv_area_t*>(lv_event_get_param(event));
-        const uint32_t now = self->NowUs();
-        if (first_strip) {
-            self->frame_transfer_start_us_.store(now, std::memory_order_relaxed);
-            self->refresh_tear_risk_ = false;
-            self->refresh_te_us_ = self->te_timestamp_.load();
-            self->refresh_period_us_ = self->te_period_us_.load();
-            self->refresh_scan_cycle_ =
-                ScanCycle(static_cast<int32_t>(now - self->refresh_te_us_), area->y1,
-                          self->refresh_period_us_, self->height_);
-        }
-        self->strip_area_ = *area;
-        self->strip_start_us_ = now;
-        self->strip_last_ = lv_display_flush_is_last(self->display_);
+        self->BeginStrip(*area, lv_display_flush_is_last(self->display_));
     } else if (lv_event_get_code(event) == LV_EVENT_REFR_READY) {
         if (self->refreshing_frame_) {
             self->refreshing_frame_ = false;
             xSemaphoreGive(self->refresh_ready_);
         }
     }
+}
+
+void GrokbotDisplay::BeginStrip(const lv_area_t& area, bool last) {
+    const bool first_strip = awaiting_te_;
+    if (first_strip) {
+        awaiting_te_ = false;
+        // Every flush waits under the LVGL lock; low-fps pacing happened before submission.
+        const int sync_fps =
+            refreshing_frame_ && refresh_fps_ >= kNormalFps ? refresh_fps_ : kPanelTeHz;
+        WaitForTeFrame(sync_fps, refreshing_frame_);
+        if (refreshing_frame_) {
+            const int64_t now = NowUs();
+            const int64_t previous = last_present_us_.exchange(now);
+            if (previous) {
+                portENTER_CRITICAL(&mailbox_mux_);
+                const uint32_t interval = now - previous;
+                te_lag_max_us_ = std::max(
+                    te_lag_max_us_, uint32_t(now) - te_timestamp_.load(std::memory_order_relaxed));
+                if (interval_count_ < 256)
+                    frame_intervals_[interval_count_++] = interval;
+                if (interval > 40000)
+                    ++slow_frames_;
+                portEXIT_CRITICAL(&mailbox_mux_);
+            }
+        }
+    }
+    const uint32_t now = NowUs();
+    if (first_strip) {
+        frame_transfer_start_us_.store(now, std::memory_order_relaxed);
+        refresh_tear_risk_ = false;
+        refresh_te_us_ = te_timestamp_.load();
+        refresh_period_us_ = te_period_us_.load();
+        refresh_scan_cycle_ = ScanCycle(static_cast<int32_t>(now - refresh_te_us_), area.y1,
+                                        refresh_period_us_, height_);
+    }
+    strip_area_ = area;
+    strip_start_us_ = now;
+    strip_last_ = last;
+}
+
+void GrokbotDisplay::InstallRotationFlush() {
+    auto* draw_buf = lv_display_get_buf_active(display_);
+    if (!draw_buf)
+        return;
+    // LVGL keeps the unrotated frame in PSRAM. Reuse its old DMA buffer as two strips.
+    rotation_dma_ = reinterpret_cast<uint16_t*>(draw_buf->data);
+    rotation_dma_pixels_ = draw_buf->data_size / (2 * sizeof(uint16_t));
+    if (rotation_dma_pixels_ < static_cast<size_t>(2 * width_))
+        return;
+    const size_t stride = lv_draw_buf_width_to_stride(width_, LV_COLOR_FORMAT_RGB565);
+    const size_t canvas_bytes = stride * height_;
+    rotation_canvas_ =
+        static_cast<uint16_t*>(heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    strip_done_ = xSemaphoreCreateBinary();
+    if (!rotation_canvas_ || !strip_done_) {
+        heap_caps_free(rotation_canvas_);
+        rotation_canvas_ = nullptr;
+        if (strip_done_)
+            vSemaphoreDelete(strip_done_);
+        strip_done_ = nullptr;
+        ESP_LOGW(TAG, "Could not allocate gravity rotation buffers");
+        return;
+    }
+
+    lv_display_set_user_data(display_, this);
+    lv_display_set_buffers(display_, rotation_canvas_, nullptr, canvas_bytes,
+                           LV_DISPLAY_RENDER_MODE_DIRECT);
+    lv_display_set_flush_cb(display_, RotationFlush);
+    lv_obj_invalidate(lv_display_get_screen_active(display_));
+}
+
+void GrokbotDisplay::RotationFlush(lv_display_t* display, const lv_area_t* area, uint8_t*) {
+    auto* self = static_cast<GrokbotDisplay*>(lv_display_get_user_data(display));
+    const lv_point_t offset{lv_display_get_offset_x(display), lv_display_get_offset_y(display)};
+    lv_area_t dirty{area->x1 - offset.x, area->y1 - offset.y, area->x2 - offset.x,
+                    area->y2 - offset.y};
+    auto& joined = self->rotation_dirty_;
+    joined = {std::min(joined.x1, dirty.x1), std::min(joined.y1, dirty.y1),
+              std::max(joined.x2, dirty.x2), std::max(joined.y2, dirty.y2)};
+
+    if (lv_display_flush_is_last(display))
+        self->FlushRotated(self->rotation_dirty_, offset);
+    lv_display_flush_ready(display);
+}
+
+void GrokbotDisplay::FlushRotated(lv_area_t dirty, lv_point_t offset) {
+    const int angle = flush_rotation_;
+    const int cx = width_ / 2;
+    const int cy = height_ / 2;
+    const lv_point_t center{cx, cy};
+    if (angle != 0) {
+        lv_point_t corners[] = {
+            {dirty.x1, dirty.y1}, {dirty.x2, dirty.y1}, {dirty.x1, dirty.y2}, {dirty.x2, dirty.y2}};
+        lv_point_array_transform(corners, 4, angle, 256, 256, &center, false);
+        dirty = {corners[0].x, corners[0].y, corners[0].x, corners[0].y};
+        for (const auto& point : corners) {
+            dirty.x1 = std::min(dirty.x1, point.x);
+            dirty.y1 = std::min(dirty.y1, point.y);
+            dirty.x2 = std::max(dirty.x2, point.x);
+            dirty.y2 = std::max(dirty.y2, point.y);
+        }
+        dirty.x1 = std::max<int32_t>(0, (dirty.x1 - 2) & ~1);
+        dirty.y1 = std::max<int32_t>(0, (dirty.y1 - 2) & ~1);
+        dirty.x2 = std::min<int32_t>(width_ - 1, (dirty.x2 + 2) | 1);
+        dirty.y2 = std::min<int32_t>(height_ - 1, (dirty.y2 + 2) | 1);
+    }
+
+    constexpr int kShift = 15;
+    constexpr int kUnit = 1 << kShift;
+    const int sine = lv_trigo_sin(angle / 10);
+    const int cosine = lv_trigo_sin(angle / 10 + 90);
+    const int columns = lv_area_get_width(&dirty);
+    const int canvas_pitch = lv_display_get_buf_active(display_)->header.stride / sizeof(uint16_t);
+    const int strip_rows = (rotation_dma_pixels_ / columns) & ~size_t{1};
+    bool pending = false;
+    uint16_t* buffer = rotation_dma_;
+    for (int y = dirty.y1; y <= dirty.y2; y += strip_rows) {
+        const int end = std::min<int32_t>(y + strip_rows, dirty.y2 + 1);
+        auto* out = buffer;
+        if (angle == 0) {
+            for (int row = y; row < end; ++row) {
+                memcpy(out, rotation_canvas_ + row * canvas_pitch + dirty.x1, columns * sizeof(*out));
+                out += columns;
+            }
+            lv_draw_sw_rgb565_swap(buffer, (end - y) * columns);
+        } else {
+            // shortcut: nearest-neighbor can alias thin text, use interpolation if needed.
+            for (int row = y; row < end; ++row) {
+                int u = cx * kUnit + cosine * (dirty.x1 - cx) + sine * (row - cy) + kUnit / 2;
+                int v = cy * kUnit - sine * (dirty.x1 - cx) + cosine * (row - cy) + kUnit / 2;
+                for (int x = 0; x < columns; ++x, u += cosine, v -= sine) {
+                    const auto sx = static_cast<unsigned>(u >> kShift);
+                    const auto sy = static_cast<unsigned>(v >> kShift);
+                    const uint16_t pixel = sx < unsigned(width_) && sy < unsigned(height_)
+                                               ? rotation_canvas_[sy * canvas_pitch + sx]
+                                               : 0;
+                    *out++ = __builtin_bswap16(pixel);
+                }
+            }
+        }
+        if (pending)
+            xSemaphoreTake(strip_done_, portMAX_DELAY);
+        const lv_area_t strip{dirty.x1 + offset.x, y + offset.y, dirty.x2 + offset.x,
+                              end - 1 + offset.y};
+        BeginStrip(strip, end > dirty.y2);
+        const auto err = esp_lcd_panel_draw_bitmap(panel_, strip.x1, strip.y1, strip.x2 + 1,
+                                                   strip.y2 + 1, buffer);
+        pending = err == ESP_OK;
+        if (!pending) {
+            ESP_LOGE(TAG, "Display strip transfer failed: %s", esp_err_to_name(err));
+            break;
+        }
+        buffer = buffer == rotation_dma_ ? buffer + rotation_dma_pixels_ : rotation_dma_;
+    }
+    if (pending)
+        xSemaphoreTake(strip_done_, portMAX_DELAY);
 }
 
 void GrokbotDisplay::SetupUI() {
@@ -379,6 +509,7 @@ void GrokbotDisplay::SetupUI() {
     lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_REFR_START, this);
     lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_REFR_READY, this);
     lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_FLUSH_START, this);
+    InstallRotationFlush();
 
     if (!running_.exchange(true)) {
         if (xTaskCreatePinnedToCoreWithCaps(RefreshTaskEntry, "grokbot_refresh", 8 * 1024, this, 5,
@@ -860,14 +991,50 @@ bool GrokbotDisplay::RebuildCurrentFrame() {
     return PresentFrame();
 }
 
+void GrokbotDisplay::SetRotation(int degrees) {
+    rotation_.store(degrees * 10, std::memory_order_relaxed);
+}
+
+void GrokbotDisplay::MapTouch(int& x, int& y) {
+    if (!touch_down_.exchange(true)) {
+        // Wait for an in-flight rotation before taking the first point of the gesture.
+        DisplayLockGuard lock(this);
+    }
+    const int angle = displayed_rotation_.load();
+    lv_point_t point{x, y};
+    const lv_point_t center{width_ / 2, height_ / 2};
+    lv_point_transform(&point, -angle, 256, 256, &center, false);
+    x = point.x;
+    y = point.y;
+}
+
 void GrokbotDisplay::RefreshTaskEntry(void* arg) {
     auto* self = static_cast<GrokbotDisplay*>(arg);
+    bool logged_rotation = false;
     while (self->running_.load()) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const bool frame_pending = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200)) != 0;
+        const int angle = self->rotation_.load(std::memory_order_relaxed);
+        const bool rotate = self->rotation_canvas_ && angle != self->displayed_rotation_.load() &&
+                            !self->touch_down_.load();
+        if (!frame_pending && !rotate)
+            continue;
         {
             DisplayLockGuard lock(self);
-            if (lock && self->running_.load())
+            if (lock && self->running_.load()) {
+                const bool apply_rotation = rotate && !self->touch_down_.load();
+                if (apply_rotation) {
+                    self->flush_rotation_ = angle;
+                    lv_obj_invalidate(lv_display_get_screen_active(self->display_));
+                }
                 lv_refr_now(self->display_);
+                if (apply_rotation) {
+                    self->displayed_rotation_.store(angle);
+                    if (!logged_rotation) {
+                        ESP_LOGI(TAG, "Gravity rotation applied: %d degrees", angle / 10);
+                        logged_rotation = true;
+                    }
+                }
+            }
         }
         // Let status/chat callers acquire the shared display mutex between refreshes.
         vTaskDelay(1);

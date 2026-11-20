@@ -16,6 +16,7 @@
 #include "display/grokbot_display.h"
 #include "esp_lcd_co5300.h"
 #include "grokbot_inputs.h"
+#include "grokbot_rotation.h"
 #include "wifi_board.h"
 
 #define TAG "M5StackStopwatchGrokBot"
@@ -111,11 +112,13 @@ private:
 
     void InputTask() {
         GrokbotInputs inputs;
+        GrokbotRotation rotation;
         unsigned imu_failures = 0;
         bool touch_seen = false;
         bool imu_sample_seen = false;
         while (true) {
             const int64_t now_ms = esp_timer_get_time() / 1000;
+            bool contact = false;
             if (touch_) {
                 // CST820B may NACK while asleep, just like M5GFX's CST816S driver.
                 // Probe first so an absent/sleeping controller does not flood I2C error logs.
@@ -125,15 +128,18 @@ private:
                     uint8_t data[5] = {};
                     if (i2c_master_transmit_receive(touch_, &reg, 1, data, sizeof(data), 20) ==
                         ESP_OK) {
-                        const int x = ((data[1] & 0x0f) << 8) | data[2];
-                        const int y = ((data[3] & 0x0f) << 8) | data[4];
+                        int x = ((data[1] & 0x0f) << 8) | data[2];
+                        int y = ((data[3] & 0x0f) << 8) | data[4];
                         if (data[0] <= 1 &&
                             (!data[0] || (x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT))) {
                             if (!touch_seen) {
                                 ESP_LOGI(TAG, "CST820B responding at 0x15");
                                 touch_seen = true;
                             }
-                            QueueInteraction(inputs.Touch(data[0] == 1, x, y, now_ms), now_ms);
+                            contact = data[0] == 1;
+                            if (display_ && contact)
+                                display_->MapTouch(x, y);
+                            QueueInteraction(inputs.Touch(contact, x, y, now_ms), now_ms);
                         } else {
                             inputs.CancelTouch();
                         }
@@ -146,6 +152,8 @@ private:
                     inputs.CancelTouch();
                 }
             }
+            if (display_ && !contact)
+                display_->EndTouch();
             if (imu_) {
                 struct bmi2_sens_data sample = {};
                 if (bmi2_get_sensor_data(&sample, imu_) == BMI2_OK) {
@@ -160,6 +168,8 @@ private:
                                  y_mg, z_mg);
                         imu_sample_seen = true;
                     }
+                    if (display_)
+                        display_->SetRotation(rotation.Update(x_mg, y_mg, z_mg));
                     QueueInteraction(inputs.Motion(x_mg, y_mg, z_mg, now_ms), now_ms);
                 } else if (++imu_failures >= 5) {
                     ESP_LOGW(TAG,

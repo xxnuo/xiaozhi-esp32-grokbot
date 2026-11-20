@@ -25,6 +25,9 @@ public:
     ~GrokbotDisplay() override;
 
     void SetupUI() override;
+    void SetRotation(int degrees);
+    void MapTouch(int& x, int& y);
+    void EndTouch() { touch_down_.store(false); }
     bool SetEmotion(const char* emotion) override;
     bool OnInteraction(const char* emotion);
     void SetStatus(const char* status) override;
@@ -45,6 +48,10 @@ private:
     void InitializeTe();
     bool WaitForTeFrame(int fps, bool pace_animation = true);
     void CheckStripTransfer(uint32_t completed_us);
+    void BeginStrip(const lv_area_t& area, bool last);
+    void InstallRotationFlush();
+    static void RotationFlush(lv_display_t* display, const lv_area_t* area, uint8_t* pixels);
+    void FlushRotated(lv_area_t dirty, lv_point_t offset);
 
     bool EnsurePlayer();
     bool DecodeFrame(const GrokBotPlayer::FrameInfo& frame, bool expand);
@@ -53,6 +60,16 @@ private:
     void ExpandPackedFrame();
     bool PresentFrame();
     int64_t NowUs() const;
+
+    uint16_t* rotation_canvas_ = nullptr;
+    uint16_t* rotation_dma_ = nullptr;
+    size_t rotation_dma_pixels_ = 0;
+    SemaphoreHandle_t strip_done_ = nullptr;
+    lv_area_t rotation_dirty_{};
+    int flush_rotation_ = 0;
+    std::atomic<int> rotation_{0};
+    std::atomic<bool> touch_down_{false};
+    std::atomic<int> displayed_rotation_{0};
 
     portMUX_TYPE mailbox_mux_ = portMUX_INITIALIZER_UNLOCKED;
     GrokBotDirector director_;
