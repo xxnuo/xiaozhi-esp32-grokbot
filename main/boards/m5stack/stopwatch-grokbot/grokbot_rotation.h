@@ -5,8 +5,10 @@
 
 class GrokbotRotation {
 public:
-    // The accelerometer reports specific force, which points up at rest.
-    int Update(int right_mg, int down_mg, int normal_mg) {
+    int Update(int x_mg, int y_mg, int normal_mg) {
+        // On StopWatch, BMI270 -Y points right and +X points down on screen.
+        const int right_mg = -y_mg;
+        const int down_mg = x_mg;
         const int64_t planar = int64_t(right_mg) * right_mg + int64_t(down_mg) * down_mg;
         const int64_t total = planar + int64_t(normal_mg) * normal_mg;
         if (total < 800 * 800 || total > 1200 * 1200 ||

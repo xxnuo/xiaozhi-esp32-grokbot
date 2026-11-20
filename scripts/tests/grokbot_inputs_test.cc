@@ -8,20 +8,21 @@ using Reaction = GrokbotInputs::Reaction;
 static void TestRotation() {
     GrokbotRotation rotation;
     assert(rotation.Update(0, 0, 1000) == 0);
+    assert(rotation.Update(-1000, 0, 0) == 0);
     for (int i = 0; i < 30; ++i)
-        rotation.Update(707, -707, 0);
-    assert(std::abs(rotation.Update(707, -707, 0) - 45) <= 2);
+        rotation.Update(-707, -707, 0);
+    assert(std::abs(rotation.Update(-707, -707, 0) - 45) <= 2);
     const int held = rotation.Update(0, 0, 1000);
     assert(std::abs(held - 45) <= 2);
-    assert(rotation.Update(-1900, 0, 1000) == held);
+    assert(rotation.Update(0, 1900, 1000) == held);
     for (int i = 0; i < 30; ++i)
-        rotation.Update(17, 999, 0);
-    const int before_wrap = rotation.Update(17, 999, 0);
+        rotation.Update(999, -17, 0);
+    const int before_wrap = rotation.Update(999, -17, 0);
     assert(before_wrap >= 177);
-    assert(rotation.Update(-17, 999, 0) >= 177);
+    assert(rotation.Update(999, 17, 0) >= 177);
     for (int i = 0; i < 30; ++i)
-        rotation.Update(-1000, 0, 0);
-    assert(std::abs(rotation.Update(-1000, 0, 0) + 90) <= 2);
+        rotation.Update(0, 1000, 0);
+    assert(std::abs(rotation.Update(0, 1000, 0) + 90) <= 2);
 }
 
 int main() {
