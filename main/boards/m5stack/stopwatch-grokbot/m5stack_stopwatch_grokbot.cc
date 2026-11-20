@@ -18,6 +18,7 @@
 #include "esp_lcd_co5300.h"
 #include "grokbot_inputs.h"
 #include "grokbot_rotation.h"
+#include "mcp_server.h"
 #include "settings.h"
 #include "wifi_board.h"
 
@@ -80,9 +81,14 @@ private:
     GrokbotDisplay* display_;
     StopwatchBacklight* backlight_;
     i2c_master_dev_handle_t touch_ = nullptr;
-    int boot_orientation_ = 0;
     bmi270_handle_t imu_ = nullptr;
+    int boot_orientation_ = 0;
     std::atomic<bool> interaction_pending_{false};
+    int saved_volume_ = 70;
+    esp_timer_handle_t countdown_timer_ = nullptr;
+    esp_timer_handle_t motor_off_timer_ = nullptr;
+    int countdown_remaining_sec_ = 0;
+    std::string countdown_label_ = "Timer";
 
     void QueueInteraction(GrokbotInputs::Reaction reaction, int64_t now_ms) {
         if (reaction == GrokbotInputs::Reaction::kNone ||
@@ -140,6 +146,9 @@ private:
         unsigned imu_failures = 0;
         bool touch_seen = false;
         bool imu_sample_seen = false;
+        bool have_charge_state = false;
+        bool was_charging = false;
+        unsigned charge_poll_div = 0;
         while (true) {
             const int64_t now_ms = esp_timer_get_time() / 1000;
             if (power_button) {
@@ -167,6 +176,9 @@ private:
                     }
                 }
             }
+            bool touch_active = false;
+            float look_x = 0.0f;
+            float look_y = 0.0f;
             if (touch_) {
                 // CST820B may NACK while asleep, just like M5GFX's CST816S driver.
                 // Probe first so an absent/sleeping controller does not flood I2C error logs.
@@ -184,13 +196,23 @@ private:
                                 ESP_LOGI(TAG, "CST820B responding at 0x15");
                                 touch_seen = true;
                             }
-                            const bool down = data[0] == 1;
-                            if (down)
+                            if (data[0] == 1) {
                                 MapBootTouch(boot_orientation_, DISPLAY_WIDTH, x, y);
-                            if (display_ && display_->HandleTouch(down, x, y, now_ms))
-                                inputs.CancelTouch();
-                            else
-                                QueueInteraction(inputs.Touch(down, x, y, now_ms), now_ms);
+                                if (display_ && display_->HandleTouch(true, x, y, now_ms)) {
+                                    inputs.CancelTouch();
+                                } else {
+                                    touch_active = true;
+                                    look_x = (x - DISPLAY_WIDTH * 0.5f) / (DISPLAY_WIDTH * 0.5f);
+                                    look_y = -(y - DISPLAY_HEIGHT * 0.5f) / (DISPLAY_HEIGHT * 0.5f);
+                                    QueueInteraction(inputs.Touch(true, x, y, now_ms), now_ms);
+                                }
+                            } else {
+                                if (display_ && display_->HandleTouch(false, x, y, now_ms)) {
+                                    inputs.CancelTouch();
+                                } else {
+                                    QueueInteraction(inputs.Touch(false, x, y, now_ms), now_ms);
+                                }
+                            }
                         } else {
                             inputs.CancelTouch();
                         }
@@ -198,10 +220,11 @@ private:
                         inputs.CancelTouch();
                     }
                 } else if (probe == ESP_ERR_NOT_FOUND) {
-                    if (display_ && display_->HandleTouch(false, 0, 0, now_ms))
+                    if (display_ && display_->HandleTouch(false, 0, 0, now_ms)) {
                         inputs.CancelTouch();
-                    else
+                    } else {
                         QueueInteraction(inputs.Touch(false, 0, 0, now_ms), now_ms);
+                    }
                 } else {
                     inputs.CancelTouch();
                 }
@@ -220,11 +243,44 @@ private:
                                  y_mg, z_mg);
                         imu_sample_seen = true;
                     }
+                    if (!touch_active && norm >= 800 * 800 && norm <= 1200 * 1200) {
+                        auto axis_tilt = [](int mg) -> float {
+                            const int abs_mg = std::abs(mg);
+                            if (abs_mg <= 120)
+                                return 0.0f;
+                            const float mag =
+                                std::min(1.0f, static_cast<float>(abs_mg - 120) / 430.0f);
+                            return mg >= 0 ? mag : -mag;
+                        };
+                        look_x = axis_tilt(x_mg);
+                        look_y = -axis_tilt(y_mg);
+                    }
                     QueueInteraction(inputs.Motion(x_mg, y_mg, z_mg, now_ms), now_ms);
                 } else if (++imu_failures >= 5) {
                     ESP_LOGW(TAG,
                              "BMI270 unavailable after repeated read errors; disabling motion");
                     bmi270_sensor_del(&imu_);
+                }
+            }
+            if (display_) {
+                display_->SetLookTarget(look_x, look_y);
+            }
+            if (++charge_poll_div >= 20) {
+                charge_poll_div = 0;
+                int level = 0;
+                bool charging = false;
+                bool discharging = false;
+                if (GetBatteryLevel(level, charging, discharging)) {
+                    if (have_charge_state && !was_charging && charging &&
+                        Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                        Application::GetInstance().Schedule([this]() {
+                            if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                                display_->OnInteraction("happy");
+                            }
+                        });
+                    }
+                    was_charging = charging;
+                    have_charge_state = true;
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -435,8 +491,9 @@ private:
         const bool swap = boot_orientation_ % 2 != 0;
         const bool mirror_x = boot_orientation_ == 1 || boot_orientation_ == 2;
         const bool mirror_y = boot_orientation_ >= 2;
-        // CO5300 keeps its GRAM origin on mirror; MV only exchanges the axes.
-        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, swap ? 0 : 6, swap ? 6 : 0));
+        // The 466px visible area sits in 480px GRAM. Rotated rows need the
+        // 14px origin used by the StopWatch panel mapping to cover the edge.
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel, swap ? 0 : 6, swap ? 14 : 0));
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, false);
@@ -526,6 +583,117 @@ private:
             GetDisplay()->ShowNotification(std::string(Lang::Strings::VOLUME) + ":" +
                                            std::to_string(volume) + "%");
         });
+
+        // Button2 double-click: cycle screen brightness 25% -> 50% -> 75% -> 100%
+        button2_.OnDoubleClick([this]() {
+            if (!backlight_)
+                return;
+            const uint8_t current = backlight_->brightness();
+            const uint8_t next = current < 35 ? 50 : current < 65 ? 75 : current < 90 ? 100 : 25;
+            backlight_->SetBrightness(next, true);
+            if (display_) {
+                display_->ShowNotification("Brightness: " + std::to_string(next) + "%");
+            }
+        });
+
+        // Button2 long-press: quick mute / unmute
+        button2_.OnLongPress([this]() {
+            auto* codec = GetAudioCodec();
+            const int current = codec->output_volume();
+            int target = 0;
+            if (current > 0) {
+                saved_volume_ = current;
+                target = 0;
+            } else {
+                target = saved_volume_ > 0 ? saved_volume_ : 70;
+            }
+            codec->SetOutputVolume(target);
+            if (display_) {
+                display_->ShowNotification(target == 0 ? "Muted"
+                                                       : std::string(Lang::Strings::VOLUME) + ":" +
+                                                             std::to_string(target) + "%");
+            }
+        });
+    }
+
+    void InitializeTimerTool() {
+        esp_timer_create_args_t timer_args = {
+            .callback =
+                [](void* arg) {
+                    auto* self = static_cast<M5StackStopwatchGrokbotBoard*>(arg);
+                    Application::GetInstance().Schedule([self]() { self->OnCountdownTick(); });
+                },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "stopwatch_timer",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &countdown_timer_));
+
+        esp_timer_create_args_t motor_args = {
+            .callback =
+                [](void* arg) {
+                    auto* self = static_cast<M5StackStopwatchGrokbotBoard*>(arg);
+                    self->ioe_.digitalWrite(IOE_PIN_MOTOR, LOW);
+                },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "motor_off",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&motor_args, &motor_off_timer_));
+
+        McpServer::GetInstance().AddTool(
+            "self.stopwatch.timer",
+            "Start or cancel a countdown / Pomodoro timer on the stopwatch. "
+            "Set seconds > 0 to start, or seconds = 0 to cancel.",
+            PropertyList({Property("seconds", kPropertyTypeInteger, 0, 7200),
+                          Property("label", kPropertyTypeString, std::string("Timer"))}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                const int seconds = properties["seconds"].value<int>();
+                const std::string label = properties["label"].value<std::string>();
+                esp_timer_stop(countdown_timer_);
+                countdown_remaining_sec_ = seconds;
+                countdown_label_ = label.empty() ? "Timer" : label;
+                if (seconds <= 0) {
+                    if (display_)
+                        display_->ShowNotification("Timer canceled", 2000);
+                    return std::string("Timer canceled");
+                }
+                esp_timer_start_periodic(countdown_timer_, 1000000);
+                UpdateCountdownBanner();
+                return "Started " + countdown_label_ + " for " + std::to_string(seconds) + "s";
+            });
+    }
+
+    void UpdateCountdownBanner() {
+        if (!display_)
+            return;
+        const int mins = countdown_remaining_sec_ / 60;
+        const int secs = countdown_remaining_sec_ % 60;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%s %02d:%02d", countdown_label_.c_str(), mins, secs);
+        display_->ShowNotification(buf, 1200);
+    }
+
+    void OnCountdownTick() {
+        if (countdown_remaining_sec_ <= 0) {
+            esp_timer_stop(countdown_timer_);
+            return;
+        }
+        --countdown_remaining_sec_;
+        if (countdown_remaining_sec_ > 0) {
+            UpdateCountdownBanner();
+            return;
+        }
+        esp_timer_stop(countdown_timer_);
+        if (display_) {
+            display_->ShowNotification(countdown_label_ + " Done!", 5000);
+            display_->SetEmotion("notifying");
+        }
+        Application::GetInstance().PlaySound(Lang::Sounds::OGG_VIBRATION);
+        ioe_.digitalWrite(IOE_PIN_MOTOR, HIGH);
+        esp_timer_start_once(motor_off_timer_, 180000);
     }
 
 public:
@@ -542,6 +710,7 @@ public:
         InitializeDisplay();
         InitializeButtons();
         InitializeInputTask();
+        InitializeTimerTool();
     }
 
     AudioCodec* GetAudioCodec() override {
