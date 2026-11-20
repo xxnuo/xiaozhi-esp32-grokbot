@@ -6,23 +6,19 @@
 using Reaction = GrokbotInputs::Reaction;
 
 static void TestRotation() {
-    GrokbotRotation rotation;
-    assert(rotation.Update(0, 0, 1000) == 0);
-    assert(rotation.Update(-1000, 0, 0) == 0);
-    for (int i = 0; i < 30; ++i)
-        rotation.Update(-707, -707, 0);
-    assert(std::abs(rotation.Update(-707, -707, 0) + 45) <= 2);
-    const int held = rotation.Update(0, 0, 1000);
-    assert(std::abs(held + 45) <= 2);
-    assert(rotation.Update(0, 1900, 1000) == held);
-    for (int i = 0; i < 30; ++i)
-        rotation.Update(999, -17, 0);
-    const int before_wrap = rotation.Update(999, -17, 0);
-    assert(before_wrap <= -177);
-    assert(rotation.Update(999, 17, 0) <= -177);
-    for (int i = 0; i < 30; ++i)
-        rotation.Update(0, 1000, 0);
-    assert(std::abs(rotation.Update(0, 1000, 0) - 90) <= 2);
+    assert(BootOrientation(-8192, 0, 0) == 0);
+    assert(BootOrientation(0, 8192, 0) == 1);
+    assert(BootOrientation(8192, 0, 0) == 2);
+    assert(BootOrientation(0, -8192, 0) == 3);
+    assert(BootOrientation(0, 0, 8192) == 0);
+    assert(BootOrientation(0, 16000, 0) == 0);
+    const int physical[][2] = {{10, 20}, {445, 10}, {455, 445}, {20, 455}};
+    for (int orientation = 0; orientation < 4; ++orientation) {
+        int x = physical[orientation][0];
+        int y = physical[orientation][1];
+        MapBootTouch(orientation, 466, x, y);
+        assert(x == 10 && y == 20);
+    }
 }
 
 int main() {

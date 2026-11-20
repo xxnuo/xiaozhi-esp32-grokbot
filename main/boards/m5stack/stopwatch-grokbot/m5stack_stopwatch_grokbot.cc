@@ -2,6 +2,7 @@
 #include <driver/spi_master.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <ssid_manager.h>
 #include <wifi_manager.h>
 #include <atomic>
 #include "M5IOE1.h"
@@ -17,6 +18,7 @@
 #include "esp_lcd_co5300.h"
 #include "grokbot_inputs.h"
 #include "grokbot_rotation.h"
+#include "settings.h"
 #include "wifi_board.h"
 
 #define TAG "M5StackStopwatchGrokBot"
@@ -77,6 +79,7 @@ private:
     GrokbotDisplay* display_;
     StopwatchBacklight* backlight_;
     i2c_master_dev_handle_t touch_ = nullptr;
+    int boot_orientation_ = 0;
     bmi270_handle_t imu_ = nullptr;
     std::atomic<bool> interaction_pending_{false};
 
@@ -112,13 +115,11 @@ private:
 
     void InputTask() {
         GrokbotInputs inputs;
-        GrokbotRotation rotation;
         unsigned imu_failures = 0;
         bool touch_seen = false;
         bool imu_sample_seen = false;
         while (true) {
             const int64_t now_ms = esp_timer_get_time() / 1000;
-            bool contact = false;
             if (touch_) {
                 // CST820B may NACK while asleep, just like M5GFX's CST816S driver.
                 // Probe first so an absent/sleeping controller does not flood I2C error logs.
@@ -136,10 +137,13 @@ private:
                                 ESP_LOGI(TAG, "CST820B responding at 0x15");
                                 touch_seen = true;
                             }
-                            contact = data[0] == 1;
-                            if (display_ && contact)
-                                display_->MapTouch(x, y);
-                            QueueInteraction(inputs.Touch(contact, x, y, now_ms), now_ms);
+                            const bool down = data[0] == 1;
+                            if (down)
+                                MapBootTouch(boot_orientation_, DISPLAY_WIDTH, x, y);
+                            if (display_ && display_->HandleTouch(down, x, y, now_ms))
+                                inputs.CancelTouch();
+                            else
+                                QueueInteraction(inputs.Touch(down, x, y, now_ms), now_ms);
                         } else {
                             inputs.CancelTouch();
                         }
@@ -147,13 +151,14 @@ private:
                         inputs.CancelTouch();
                     }
                 } else if (probe == ESP_ERR_NOT_FOUND) {
-                    QueueInteraction(inputs.Touch(false, 0, 0, now_ms), now_ms);
+                    if (display_ && display_->HandleTouch(false, 0, 0, now_ms))
+                        inputs.CancelTouch();
+                    else
+                        QueueInteraction(inputs.Touch(false, 0, 0, now_ms), now_ms);
                 } else {
                     inputs.CancelTouch();
                 }
             }
-            if (display_ && !contact)
-                display_->EndTouch();
             if (imu_) {
                 struct bmi2_sens_data sample = {};
                 if (bmi2_get_sensor_data(&sample, imu_) == BMI2_OK) {
@@ -168,8 +173,6 @@ private:
                                  y_mg, z_mg);
                         imu_sample_seen = true;
                     }
-                    if (display_)
-                        display_->SetRotation(rotation.Update(x_mg, y_mg, z_mg));
                     QueueInteraction(inputs.Motion(x_mg, y_mg, z_mg, now_ms), now_ms);
                 } else if (++imu_failures >= 5) {
                     ESP_LOGW(TAG,
@@ -242,6 +245,9 @@ private:
         ESP_LOGI(TAG, "Optional inputs: touch=%s, BMI270=%s",
                  touch_ ? "polling (presence unconfirmed)" : "disabled",
                  imu_ ? "ready" : "disabled");
+    }
+
+    void InitializeInputTask() {
         if ((touch_ || imu_) &&
             xTaskCreate(
                 [](void* arg) { static_cast<M5StackStopwatchGrokbotBoard*>(arg)->InputTask(); },
@@ -318,6 +324,18 @@ private:
         ESP_ERROR_CHECK(spi_bus_initialize(DISPLAY_QSPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
 
+    void ReadBootOrientation() {
+        if (!imu_ || !Settings("display").GetBool("boot_orient"))
+            return;
+        // BMI270 runs at 25 Hz. Wait for its filtered output to settle.
+        vTaskDelay(pdMS_TO_TICKS(160));
+        bmi2_sens_data sample = {};
+        if (bmi2_get_sensor_data(&sample, imu_) == BMI2_OK) {
+            boot_orientation_ = BootOrientation(sample.acc.x, sample.acc.y, sample.acc.z);
+        }
+        ESP_LOGI(TAG, "Boot orientation: %d degrees", boot_orientation_ * 90);
+    }
+
     void InitializeDisplay() {
         ioe_.digitalWrite(IOE_PIN_LCD_RST, LOW);
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -353,16 +371,66 @@ private:
         panel_config.vendor_config = &vendor_config;
         ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(panel_io, &panel_config, &panel));
 
-        esp_lcd_panel_set_gap(panel, 0x06, 0);
+        const bool swap = boot_orientation_ % 2 != 0;
+        const bool mirror_x = boot_orientation_ == 1 || boot_orientation_ == 2;
+        const bool mirror_y = boot_orientation_ >= 2;
+        const int x_gap = mirror_x ? 8 : 6;
+        const int y_gap = mirror_y ? 14 : 0;
+        esp_lcd_panel_set_gap(panel, swap ? y_gap : x_gap, swap ? x_gap : y_gap);
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, false);
-        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, swap));
+        ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, mirror_x, mirror_y));
         esp_lcd_panel_disp_on_off(panel, true);
 
         display_ = new GrokbotDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
-                                      DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
-                                      DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY, DISPLAY_TE_PIN);
+                                      DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, mirror_x,
+                                      mirror_y, swap, DISPLAY_TE_PIN);
+        display_->SetSettingsCallbacks(
+            []() {
+                std::vector<std::string> names;
+                for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+                    names.push_back(item.ssid);
+                }
+                return names;
+            },
+            [this](int index) {
+                auto& ssid_mgr = SsidManager::GetInstance();
+                const auto list = ssid_mgr.GetSsidList();
+                if (index < 0 || index >= static_cast<int>(list.size()))
+                    return;
+                const std::string target_ssid = list[index].ssid;
+                ssid_mgr.SetDefaultSsid(index);
+                const bool zh = display_->IsChinese();
+                display_->ShowNotification((zh ? "正在连接: " : "Connecting: ") + target_ssid,
+                                           3000);
+                xTaskCreate(
+                    [](void*) {
+                        auto& wifi = WifiManager::GetInstance();
+                        if (wifi.IsConfigMode()) {
+                            wifi.StopConfigAp();
+                        } else {
+                            wifi.StopStation();
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(150));
+                        wifi.StartStation();
+                        vTaskDelete(nullptr);
+                    },
+                    "wifi_switch", 4096, nullptr, 2, nullptr);
+            },
+            [this]() {
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateWifiConfiguring) {
+                    display_->ShowNotification(
+                        display_->IsChinese() ? "已在配网模式" : "Already in Wi-Fi Config", 2500);
+                    return;
+                }
+                if (app.GetDeviceState() == kDeviceStateActivating) {
+                    app.SetDeviceState(kDeviceStateIdle);
+                }
+                EnterWifiConfigMode();
+            });
         backlight_ = new StopwatchBacklight(panel_io, display_);
         backlight_->RestoreBrightness();
     }
@@ -370,6 +438,10 @@ private:
     void InitializeButtons() {
         // Button1: wake / toggle conversation
         button1_.OnClick([this]() {
+            if (display_ && display_->IsSettingsMenuOpen()) {
+                display_->SettingsSelectItem();
+                return;
+            }
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting &&
                 !WifiManager::GetInstance().IsConnected()) {
@@ -381,6 +453,10 @@ private:
 
         // Button2: volume 0 -> 10 -> ... -> 100 -> 0
         button2_.OnClick([this]() {
+            if (display_ && display_->IsSettingsMenuOpen()) {
+                display_->SettingsNextItem();
+                return;
+            }
             auto* codec = GetAudioCodec();
             int volume = codec->output_volume() + 10;
             if (volume > 100) {
@@ -400,10 +476,12 @@ public:
           display_(nullptr),
           backlight_(nullptr) {
         InitializeI2c();
+        InitializeInputs();
+        ReadBootOrientation();
         InitializeSpi();
         InitializeDisplay();
         InitializeButtons();
-        InitializeInputs();
+        InitializeInputTask();
     }
 
     AudioCodec* GetAudioCodec() override {

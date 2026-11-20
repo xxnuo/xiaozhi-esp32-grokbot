@@ -7,6 +7,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
 
 #include <driver/gpio.h>
 #include <freertos/FreeRTOS.h>
@@ -25,11 +28,21 @@ public:
     ~GrokbotDisplay() override;
 
     void SetupUI() override;
-    void SetRotation(int degrees);
-    void MapTouch(int& x, int& y);
-    void EndTouch() { touch_down_.store(false); }
     bool SetEmotion(const char* emotion) override;
     bool OnInteraction(const char* emotion);
+    bool IsChinese() const { return language_zh_.load(std::memory_order_relaxed); }
+    void SetLanguage(bool zh);
+    void ShowSettingsDock();
+    void HideSettingsDock();
+    void OpenSettingsMenu();
+    void CloseSettingsMenu();
+    bool IsSettingsMenuOpen() const { return menu_open_.load(std::memory_order_relaxed); }
+    bool HandleTouch(bool down, int x, int y, int64_t now_ms);
+    void SettingsNextItem();
+    void SettingsSelectItem();
+    void SetSettingsCallbacks(std::function<std::vector<std::string>()> get_ssids,
+                              std::function<void(int)> select_ssid,
+                              std::function<void()> enter_wifi_config);
     void SetStatus(const char* status) override;
     void SetChatMessage(const char* role, const char* content) override;
     void ShowNotification(const char* notification, int duration_ms = 3000) override;
@@ -48,10 +61,6 @@ private:
     void InitializeTe();
     bool WaitForTeFrame(int fps, bool pace_animation = true);
     void CheckStripTransfer(uint32_t completed_us);
-    void BeginStrip(const lv_area_t& area, bool last);
-    void InstallRotationFlush();
-    static void RotationFlush(lv_display_t* display, const lv_area_t* area, uint8_t* pixels);
-    void FlushRotated(lv_area_t dirty, lv_point_t offset);
 
     bool EnsurePlayer();
     bool DecodeFrame(const GrokBotPlayer::FrameInfo& frame, bool expand);
@@ -60,16 +69,6 @@ private:
     void ExpandPackedFrame();
     bool PresentFrame();
     int64_t NowUs() const;
-
-    uint16_t* rotation_canvas_ = nullptr;
-    uint16_t* rotation_dma_ = nullptr;
-    size_t rotation_dma_pixels_ = 0;
-    SemaphoreHandle_t strip_done_ = nullptr;
-    lv_area_t rotation_dirty_{};
-    int flush_rotation_ = 0;
-    std::atomic<int> rotation_{0};
-    std::atomic<bool> touch_down_{false};
-    std::atomic<int> displayed_rotation_{0};
 
     portMUX_TYPE mailbox_mux_ = portMUX_INITIALIZER_UNLOCKED;
     GrokBotDirector director_;
@@ -114,6 +113,41 @@ private:
     unsigned fade_step_ = kGrokBotFadeFrames;
     bool have_displayed_frame_ = false;
     std::atomic<int64_t> last_present_us_{0};
+    std::atomic<bool> language_zh_{true};
+    std::atomic<bool> dock_visible_{false};
+    std::atomic<bool> menu_open_{false};
+    std::atomic<int64_t> dock_hide_at_us_{0};
+    std::atomic<int64_t> menu_idle_at_us_{0};
+
+    lv_obj_t* settings_dock_btn_ = nullptr;
+    lv_obj_t* settings_dock_label_ = nullptr;
+    lv_obj_t* settings_panel_ = nullptr;
+    lv_obj_t* settings_title_label_ = nullptr;
+    static constexpr int kMaxMenuRows = 6;
+    lv_obj_t* settings_rows_[kMaxMenuRows] = {};
+    lv_obj_t* settings_row_labels_[kMaxMenuRows] = {};
+    std::string last_raw_status_;
+    enum class MenuAction { kLang, kBootOrient, kWifiSelect, kWifiConfig, kClose };
+    struct MenuItem {
+        MenuAction action = MenuAction::kClose;
+        int param = 0;
+        std::string text;
+    };
+    std::vector<MenuItem> menu_items_;
+    int menu_selected_ = 0;
+    bool touch_tracking_ = false;
+    bool touch_consumed_ = false;
+    int touch_start_x_ = 0;
+    int touch_start_y_ = 0;
+    int touch_last_x_ = 0;
+    int touch_last_y_ = 0;
+    std::function<std::vector<std::string>()> get_ssids_cb_;
+    std::function<void(int)> select_ssid_cb_;
+    std::function<void()> enter_wifi_config_cb_;
+
+    void RebuildSettingsMenuLocked();
+    void ExecuteMenuItem(int index);
+    const char* TranslateStatus(const char* status) const;
     uint32_t frame_intervals_[256] = {};
     unsigned interval_count_ = 0;
     unsigned slow_frames_ = 0;

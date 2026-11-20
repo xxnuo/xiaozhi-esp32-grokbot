@@ -1,35 +1,27 @@
 #pragma once
 
-#include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <utility>
 
-class GrokbotRotation {
-public:
-    int Update(int x_mg, int y_mg, int normal_mg) {
-        // On StopWatch, BMI270 +Y points right and +X points down on screen.
-        const int right_mg = y_mg;
-        const int down_mg = x_mg;
-        const int64_t planar = int64_t(right_mg) * right_mg + int64_t(down_mg) * down_mg;
-        const int64_t total = planar + int64_t(normal_mg) * normal_mg;
-        if (total < 800 * 800 || total > 1200 * 1200 ||
-            planar < (tracking_ ? 250 * 250 : 350 * 350)) {
-            tracking_ = false;
-            return angle_;
-        }
+// BMI270 specific force points up at rest; the screen uses +Y right and +X down.
+inline int BootOrientation(int x, int y, int z) {
+    const int64_t planar = int64_t(x) * x + int64_t(y) * y;
+    const int64_t total = planar + int64_t(z) * z;
+    // At +/-4 g, 8192 counts equal 1 g.
+    if (total < 6554LL * 6554 || total > 9830LL * 9830 || planar < 2867LL * 2867)
+        return 0;
+    if (std::abs(x) >= std::abs(y))
+        return x < 0 ? 0 : 2;
+    return y > 0 ? 1 : 3;
+}
 
-        tracking_ = true;
-        constexpr float kDegreesPerRadian = 57.2957795f;
-        const float target = std::atan2(float(right_mg), -float(down_mg)) * kDegreesPerRadian;
-        const float delta = std::remainder(target - filtered_angle_, 360.0f);
-        filtered_angle_ = std::remainder(filtered_angle_ + 0.28f * delta, 360.0f);
-        if (std::abs(std::remainder(filtered_angle_ - angle_, 360.0f)) >= 1.5f) {
-            angle_ = static_cast<int>(std::lround(filtered_angle_));
-        }
-        return angle_;
-    }
-
-private:
-    bool tracking_ = false;
-    float filtered_angle_ = 0;
-    int angle_ = 0;
-};
+inline void MapBootTouch(int orientation, int size, int& x, int& y) {
+    const int last = size - 1;
+    if (orientation >= 2)
+        y = last - y;
+    if (orientation == 1 || orientation == 2)
+        x = last - x;
+    if (orientation % 2 != 0)
+        std::swap(x, y);
+}

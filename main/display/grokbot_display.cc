@@ -6,6 +6,7 @@
 #include "assets.h"
 #include "assets/lang_config.h"
 #include "lvgl_theme.h"
+#include "settings.h"
 
 #include <algorithm>
 #include <cstring>
@@ -107,6 +108,8 @@ GrokbotDisplay::GrokbotDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
       director_(static_cast<uint32_t>(esp_timer_get_time())),
       te_pin_(te_pin) {
     show_idle_clock_ = false;
+    Settings display_settings("display", false);
+    language_zh_.store(display_settings.GetInt("lang", 0) == 0, std::memory_order_relaxed);
 }
 
 GrokbotDisplay::~GrokbotDisplay() {
@@ -115,8 +118,6 @@ GrokbotDisplay::~GrokbotDisplay() {
         DisplayLockGuard lock(this);
         if (lock && display_) {
             lv_display_remove_event_cb_with_user_data(display_, RefreshEventCb, this);
-            if (rotation_canvas_)
-                lv_timer_pause(lv_display_get_refr_timer(display_));
             if (emoji_image_)
                 lv_image_set_src(emoji_image_, nullptr);
         }
@@ -137,9 +138,6 @@ GrokbotDisplay::~GrokbotDisplay() {
         vSemaphoreDelete(te_semaphore_);
         te_semaphore_ = nullptr;
     }
-    heap_caps_free(rotation_canvas_);
-    if (strip_done_)
-        vSemaphoreDelete(strip_done_);
     heap_caps_free(start_frames_);
     heap_caps_free(retired_image_);
     heap_caps_free(displayed_packed_);
@@ -238,11 +236,6 @@ bool GrokbotDisplay::TransferDone(esp_lcd_panel_io_handle_t io,
                                            maximum, elapsed_us, std::memory_order_relaxed)) {
         }
     }
-    if (self->strip_done_) {
-        BaseType_t wake = pdFALSE;
-        xSemaphoreGiveFromISR(self->strip_done_, &wake);
-        return wake == pdTRUE;
-    }
     lv_display_flush_ready(self->display_);
     return false;
 }
@@ -289,172 +282,52 @@ void GrokbotDisplay::RefreshEventCb(lv_event_t* event) {
     if (lv_event_get_code(event) == LV_EVENT_REFR_START) {
         self->refreshing_frame_ = self->refresh_pending_.exchange(false);
         self->awaiting_te_ = true;
-        self->rotation_dirty_ = {self->width_, self->height_, -1, -1};
-    } else if (lv_event_get_code(event) == LV_EVENT_FLUSH_START && !self->rotation_canvas_) {
+    } else if (lv_event_get_code(event) == LV_EVENT_FLUSH_START) {
+        const bool first_strip = self->awaiting_te_;
+        if (first_strip) {
+            self->awaiting_te_ = false;
+            // Every flush waits under the LVGL lock; low-fps pacing happened before submission.
+            const int sync_fps = self->refreshing_frame_ && self->refresh_fps_ >= kNormalFps
+                                     ? self->refresh_fps_
+                                     : kPanelTeHz;
+            self->WaitForTeFrame(sync_fps, self->refreshing_frame_);
+            if (self->refreshing_frame_) {
+                const int64_t now = self->NowUs();
+                const int64_t previous = self->last_present_us_.exchange(now);
+                if (previous) {
+                    portENTER_CRITICAL(&self->mailbox_mux_);
+                    const uint32_t interval = now - previous;
+                    self->te_lag_max_us_ = std::max(
+                        self->te_lag_max_us_,
+                        uint32_t(now) - self->te_timestamp_.load(std::memory_order_relaxed));
+                    if (self->interval_count_ < 256)
+                        self->frame_intervals_[self->interval_count_++] = interval;
+                    if (interval > 40000)
+                        ++self->slow_frames_;
+                    portEXIT_CRITICAL(&self->mailbox_mux_);
+                }
+            }
+        }
         const auto* area = static_cast<lv_area_t*>(lv_event_get_param(event));
-        self->BeginStrip(*area, lv_display_flush_is_last(self->display_));
+        const uint32_t now = self->NowUs();
+        if (first_strip) {
+            self->frame_transfer_start_us_.store(now, std::memory_order_relaxed);
+            self->refresh_tear_risk_ = false;
+            self->refresh_te_us_ = self->te_timestamp_.load();
+            self->refresh_period_us_ = self->te_period_us_.load();
+            self->refresh_scan_cycle_ =
+                ScanCycle(static_cast<int32_t>(now - self->refresh_te_us_), area->y1,
+                          self->refresh_period_us_, self->height_);
+        }
+        self->strip_area_ = *area;
+        self->strip_start_us_ = now;
+        self->strip_last_ = lv_display_flush_is_last(self->display_);
     } else if (lv_event_get_code(event) == LV_EVENT_REFR_READY) {
         if (self->refreshing_frame_) {
             self->refreshing_frame_ = false;
             xSemaphoreGive(self->refresh_ready_);
         }
     }
-}
-
-void GrokbotDisplay::BeginStrip(const lv_area_t& area, bool last) {
-    const bool first_strip = awaiting_te_;
-    if (first_strip) {
-        awaiting_te_ = false;
-        // Every flush waits under the LVGL lock; low-fps pacing happened before submission.
-        const int sync_fps =
-            refreshing_frame_ && refresh_fps_ >= kNormalFps ? refresh_fps_ : kPanelTeHz;
-        WaitForTeFrame(sync_fps, refreshing_frame_);
-        if (refreshing_frame_) {
-            const int64_t now = NowUs();
-            const int64_t previous = last_present_us_.exchange(now);
-            if (previous) {
-                portENTER_CRITICAL(&mailbox_mux_);
-                const uint32_t interval = now - previous;
-                te_lag_max_us_ = std::max(
-                    te_lag_max_us_, uint32_t(now) - te_timestamp_.load(std::memory_order_relaxed));
-                if (interval_count_ < 256)
-                    frame_intervals_[interval_count_++] = interval;
-                if (interval > 40000)
-                    ++slow_frames_;
-                portEXIT_CRITICAL(&mailbox_mux_);
-            }
-        }
-    }
-    const uint32_t now = NowUs();
-    if (first_strip) {
-        frame_transfer_start_us_.store(now, std::memory_order_relaxed);
-        refresh_tear_risk_ = false;
-        refresh_te_us_ = te_timestamp_.load();
-        refresh_period_us_ = te_period_us_.load();
-        refresh_scan_cycle_ = ScanCycle(static_cast<int32_t>(now - refresh_te_us_), area.y1,
-                                        refresh_period_us_, height_);
-    }
-    strip_area_ = area;
-    strip_start_us_ = now;
-    strip_last_ = last;
-}
-
-void GrokbotDisplay::InstallRotationFlush() {
-    auto* draw_buf = lv_display_get_buf_active(display_);
-    if (!draw_buf)
-        return;
-    // LVGL keeps the unrotated frame in PSRAM. Reuse its old DMA buffer as two strips.
-    rotation_dma_ = reinterpret_cast<uint16_t*>(draw_buf->data);
-    rotation_dma_pixels_ = draw_buf->data_size / (2 * sizeof(uint16_t));
-    if (rotation_dma_pixels_ < static_cast<size_t>(2 * width_))
-        return;
-    const size_t stride = lv_draw_buf_width_to_stride(width_, LV_COLOR_FORMAT_RGB565);
-    const size_t canvas_bytes = stride * height_;
-    rotation_canvas_ =
-        static_cast<uint16_t*>(heap_caps_malloc(canvas_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    strip_done_ = xSemaphoreCreateBinary();
-    if (!rotation_canvas_ || !strip_done_) {
-        heap_caps_free(rotation_canvas_);
-        rotation_canvas_ = nullptr;
-        if (strip_done_)
-            vSemaphoreDelete(strip_done_);
-        strip_done_ = nullptr;
-        ESP_LOGW(TAG, "Could not allocate gravity rotation buffers");
-        return;
-    }
-
-    lv_display_set_user_data(display_, this);
-    lv_display_set_buffers(display_, rotation_canvas_, nullptr, canvas_bytes,
-                           LV_DISPLAY_RENDER_MODE_DIRECT);
-    lv_display_set_flush_cb(display_, RotationFlush);
-    lv_obj_invalidate(lv_display_get_screen_active(display_));
-}
-
-void GrokbotDisplay::RotationFlush(lv_display_t* display, const lv_area_t* area, uint8_t*) {
-    auto* self = static_cast<GrokbotDisplay*>(lv_display_get_user_data(display));
-    const lv_point_t offset{lv_display_get_offset_x(display), lv_display_get_offset_y(display)};
-    lv_area_t dirty{area->x1 - offset.x, area->y1 - offset.y, area->x2 - offset.x,
-                    area->y2 - offset.y};
-    auto& joined = self->rotation_dirty_;
-    joined = {std::min(joined.x1, dirty.x1), std::min(joined.y1, dirty.y1),
-              std::max(joined.x2, dirty.x2), std::max(joined.y2, dirty.y2)};
-
-    if (lv_display_flush_is_last(display))
-        self->FlushRotated(self->rotation_dirty_, offset);
-    lv_display_flush_ready(display);
-}
-
-void GrokbotDisplay::FlushRotated(lv_area_t dirty, lv_point_t offset) {
-    const int angle = flush_rotation_;
-    const int cx = width_ / 2;
-    const int cy = height_ / 2;
-    const lv_point_t center{cx, cy};
-    if (angle != 0) {
-        lv_point_t corners[] = {
-            {dirty.x1, dirty.y1}, {dirty.x2, dirty.y1}, {dirty.x1, dirty.y2}, {dirty.x2, dirty.y2}};
-        lv_point_array_transform(corners, 4, angle, 256, 256, &center, false);
-        dirty = {corners[0].x, corners[0].y, corners[0].x, corners[0].y};
-        for (const auto& point : corners) {
-            dirty.x1 = std::min(dirty.x1, point.x);
-            dirty.y1 = std::min(dirty.y1, point.y);
-            dirty.x2 = std::max(dirty.x2, point.x);
-            dirty.y2 = std::max(dirty.y2, point.y);
-        }
-        dirty.x1 = std::max<int32_t>(0, (dirty.x1 - 2) & ~1);
-        dirty.y1 = std::max<int32_t>(0, (dirty.y1 - 2) & ~1);
-        dirty.x2 = std::min<int32_t>(width_ - 1, (dirty.x2 + 2) | 1);
-        dirty.y2 = std::min<int32_t>(height_ - 1, (dirty.y2 + 2) | 1);
-    }
-
-    constexpr int kShift = 15;
-    constexpr int kUnit = 1 << kShift;
-    const int sine = lv_trigo_sin(angle / 10);
-    const int cosine = lv_trigo_sin(angle / 10 + 90);
-    const int columns = lv_area_get_width(&dirty);
-    const int canvas_pitch = lv_display_get_buf_active(display_)->header.stride / sizeof(uint16_t);
-    const int strip_rows = (rotation_dma_pixels_ / columns) & ~size_t{1};
-    bool pending = false;
-    uint16_t* buffer = rotation_dma_;
-    for (int y = dirty.y1; y <= dirty.y2; y += strip_rows) {
-        const int end = std::min<int32_t>(y + strip_rows, dirty.y2 + 1);
-        auto* out = buffer;
-        if (angle == 0) {
-            for (int row = y; row < end; ++row) {
-                memcpy(out, rotation_canvas_ + row * canvas_pitch + dirty.x1, columns * sizeof(*out));
-                out += columns;
-            }
-            lv_draw_sw_rgb565_swap(buffer, (end - y) * columns);
-        } else {
-            // shortcut: nearest-neighbor can alias thin text, use interpolation if needed.
-            for (int row = y; row < end; ++row) {
-                int u = cx * kUnit + cosine * (dirty.x1 - cx) + sine * (row - cy) + kUnit / 2;
-                int v = cy * kUnit - sine * (dirty.x1 - cx) + cosine * (row - cy) + kUnit / 2;
-                for (int x = 0; x < columns; ++x, u += cosine, v -= sine) {
-                    const auto sx = static_cast<unsigned>(u >> kShift);
-                    const auto sy = static_cast<unsigned>(v >> kShift);
-                    const uint16_t pixel = sx < unsigned(width_) && sy < unsigned(height_)
-                                               ? rotation_canvas_[sy * canvas_pitch + sx]
-                                               : 0;
-                    *out++ = __builtin_bswap16(pixel);
-                }
-            }
-        }
-        if (pending)
-            xSemaphoreTake(strip_done_, portMAX_DELAY);
-        const lv_area_t strip{dirty.x1 + offset.x, y + offset.y, dirty.x2 + offset.x,
-                              end - 1 + offset.y};
-        BeginStrip(strip, end > dirty.y2);
-        const auto err = esp_lcd_panel_draw_bitmap(panel_, strip.x1, strip.y1, strip.x2 + 1,
-                                                   strip.y2 + 1, buffer);
-        pending = err == ESP_OK;
-        if (!pending) {
-            ESP_LOGE(TAG, "Display strip transfer failed: %s", esp_err_to_name(err));
-            break;
-        }
-        buffer = buffer == rotation_dma_ ? buffer + rotation_dma_pixels_ : rotation_dma_;
-    }
-    if (pending)
-        xSemaphoreTake(strip_done_, portMAX_DELAY);
 }
 
 void GrokbotDisplay::SetupUI() {
@@ -495,6 +368,57 @@ void GrokbotDisplay::SetupUI() {
         lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
     }
 
+    lv_obj_t* screen = lv_screen_active();
+    settings_dock_btn_ = lv_obj_create(screen);
+    lv_obj_set_size(settings_dock_btn_, 128, 40);
+    lv_obj_align(settings_dock_btn_, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lv_obj_set_style_radius(settings_dock_btn_, 20, 0);
+    lv_obj_set_style_bg_color(settings_dock_btn_, lv_color_hex(0x0A0A0D), 0);
+    lv_obj_set_style_bg_opa(settings_dock_btn_, 225, 0);
+    lv_obj_set_style_border_width(settings_dock_btn_, 1, 0);
+    lv_obj_set_style_border_color(settings_dock_btn_, lv_color_hex(0x7A8296), 0);
+    lv_obj_set_style_pad_all(settings_dock_btn_, 0, 0);
+    lv_obj_clear_flag(settings_dock_btn_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(settings_dock_btn_, LV_OBJ_FLAG_HIDDEN);
+    settings_dock_label_ = lv_label_create(settings_dock_btn_);
+    lv_label_set_text(settings_dock_label_, IsChinese() ? "设置" : "Settings");
+    lv_obj_set_style_text_color(settings_dock_label_, lv_color_hex(0xF4F6FA), 0);
+    lv_obj_center(settings_dock_label_);
+
+    settings_panel_ = lv_obj_create(screen);
+    lv_obj_set_size(settings_panel_, 256, 256);
+    lv_obj_align(settings_panel_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(settings_panel_, 26, 0);
+    lv_obj_set_style_bg_color(settings_panel_, lv_color_hex(0x07080A), 0);
+    lv_obj_set_style_bg_opa(settings_panel_, 244, 0);
+    lv_obj_set_style_border_width(settings_panel_, 1, 0);
+    lv_obj_set_style_border_color(settings_panel_, lv_color_hex(0x4A5060), 0);
+    lv_obj_set_style_pad_ver(settings_panel_, 12, 0);
+    lv_obj_set_style_pad_hor(settings_panel_, 14, 0);
+    lv_obj_clear_flag(settings_panel_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(settings_panel_, LV_OBJ_FLAG_HIDDEN);
+
+    settings_title_label_ = lv_label_create(settings_panel_);
+    lv_label_set_text(settings_title_label_, IsChinese() ? "设置" : "Settings");
+    lv_obj_set_style_text_color(settings_title_label_, lv_color_hex(0x9BA4B5), 0);
+    lv_obj_align(settings_title_label_, LV_ALIGN_TOP_MID, 0, 0);
+
+    for (int i = 0; i < kMaxMenuRows; ++i) {
+        settings_rows_[i] = lv_obj_create(settings_panel_);
+        lv_obj_set_size(settings_rows_[i], 226, 34);
+        lv_obj_align(settings_rows_[i], LV_ALIGN_TOP_MID, 0, 28 + i * 36);
+        lv_obj_set_style_radius(settings_rows_[i], 12, 0);
+        lv_obj_set_style_border_color(settings_rows_[i], lv_color_hex(0xD0D8E8), 0);
+        lv_obj_set_style_pad_hor(settings_rows_[i], 12, 0);
+        lv_obj_set_style_pad_ver(settings_rows_[i], 0, 0);
+        lv_obj_clear_flag(settings_rows_[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(settings_rows_[i], LV_OBJ_FLAG_HIDDEN);
+        settings_row_labels_[i] = lv_label_create(settings_rows_[i]);
+        lv_label_set_long_mode(settings_row_labels_[i], LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(settings_row_labels_[i], 200);
+        lv_obj_align(settings_row_labels_[i], LV_ALIGN_LEFT_MID, 0, 0);
+    }
+
     lv_display_add_event_cb(display_, RounderEventCb, LV_EVENT_INVALIDATE_AREA, nullptr);
     InitializeTe();
     esp_lcd_panel_io_callbacks_t callbacks = {};
@@ -509,7 +433,6 @@ void GrokbotDisplay::SetupUI() {
     lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_REFR_START, this);
     lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_REFR_READY, this);
     lv_display_add_event_cb(display_, RefreshEventCb, LV_EVENT_FLUSH_START, this);
-    InstallRotationFlush();
 
     if (!running_.exchange(true)) {
         if (xTaskCreatePinnedToCoreWithCaps(RefreshTaskEntry, "grokbot_refresh", 8 * 1024, this, 5,
@@ -547,10 +470,297 @@ bool GrokbotDisplay::OnInteraction(const char* emotion) {
     return accepted;
 }
 
+void GrokbotDisplay::SetSettingsCallbacks(std::function<std::vector<std::string>()> get_ssids,
+                                          std::function<void(int)> select_ssid,
+                                          std::function<void()> enter_wifi_config) {
+    get_ssids_cb_ = std::move(get_ssids);
+    select_ssid_cb_ = std::move(select_ssid);
+    enter_wifi_config_cb_ = std::move(enter_wifi_config);
+}
+
+void GrokbotDisplay::SetLanguage(bool zh) {
+    language_zh_.store(zh, std::memory_order_relaxed);
+    Settings display_settings("display", true);
+    display_settings.SetInt("lang", zh ? 0 : 1);
+    DisplayLockGuard lock(this);
+    if (lock) {
+        if (settings_dock_label_)
+            lv_label_set_text(settings_dock_label_, zh ? "设置" : "Settings");
+        if (menu_open_.load(std::memory_order_relaxed))
+            RebuildSettingsMenuLocked();
+        if (player_ready_ && player_.selected_name()) {
+            expression_caption_ =
+                GrokBotCaption(player_.selected_name());
+        } else {
+            expression_caption_ = zh ? "你好呀！" : "Hello there!";
+        }
+        if (show_expression_caption_ && status_label_) {
+            lv_label_set_text(status_label_, expression_caption_);
+        } else if (!last_raw_status_.empty()) {
+            LvglDisplay::SetStatus(TranslateStatus(last_raw_status_.c_str()));
+        }
+    }
+    ShowNotification(zh ? "语言已切换为中文" : "Language: English", 2000);
+}
+
+void GrokbotDisplay::ShowSettingsDock() {
+    dock_hide_at_us_.store(NowUs() + 5000000LL, std::memory_order_relaxed);
+    if (dock_visible_.exchange(true, std::memory_order_relaxed))
+        return;
+    Application::GetInstance().Schedule([this]() {
+        DisplayLockGuard lock(this);
+        if (lock && settings_dock_btn_ && !menu_open_.load(std::memory_order_relaxed)) {
+            if (settings_dock_label_)
+                lv_label_set_text(settings_dock_label_, IsChinese() ? "设置" : "Settings");
+            lv_obj_clear_flag(settings_dock_btn_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(settings_dock_btn_);
+        }
+    });
+}
+
+void GrokbotDisplay::HideSettingsDock() {
+    if (!dock_visible_.exchange(false, std::memory_order_relaxed))
+        return;
+    Application::GetInstance().Schedule([this]() {
+        DisplayLockGuard lock(this);
+        if (lock && settings_dock_btn_) {
+            lv_obj_add_flag(settings_dock_btn_, LV_OBJ_FLAG_HIDDEN);
+        }
+    });
+}
+
+void GrokbotDisplay::RebuildSettingsMenuLocked() {
+    const bool zh = IsChinese();
+    if (settings_title_label_)
+        lv_label_set_text(settings_title_label_, zh ? "设置" : "Settings");
+    menu_items_.clear();
+    menu_items_.push_back({MenuAction::kLang, 0, zh ? "语言：中文" : "Language: English"});
+    const bool auto_orient = Settings("display").GetBool("boot_orient");
+    menu_items_.push_back({MenuAction::kBootOrient, !auto_orient,
+                           zh ? (auto_orient ? "开机定向：开" : "开机定向：关")
+                              : (auto_orient ? "Boot orientation: On" : "Boot orientation: Off")});
+    if (get_ssids_cb_) {
+        const auto ssids = get_ssids_cb_();
+        const int max_wifi = std::min<int>(static_cast<int>(ssids.size()), kMaxMenuRows - 4);
+        for (int i = 0; i < max_wifi; ++i) {
+            const std::string prefix = (i == 0) ? "* Wi-Fi: " : "  Wi-Fi: ";
+            menu_items_.push_back({MenuAction::kWifiSelect, i, prefix + ssids[i]});
+        }
+    }
+    menu_items_.push_back(
+        {MenuAction::kWifiConfig, 0, zh ? "配网 / 添加 Wi-Fi" : "Wi-Fi Web Config"});
+    menu_items_.push_back({MenuAction::kClose, 0, zh ? "关闭菜单" : "Close"});
+    if (menu_selected_ >= static_cast<int>(menu_items_.size()))
+        menu_selected_ = 0;
+    for (int i = 0; i < kMaxMenuRows; ++i) {
+        if (!settings_rows_[i])
+            continue;
+        if (i < static_cast<int>(menu_items_.size())) {
+            lv_label_set_text(settings_row_labels_[i], menu_items_[i].text.c_str());
+            const bool selected = (i == menu_selected_);
+            lv_obj_set_style_bg_color(settings_rows_[i],
+                                      lv_color_hex(selected ? 0x222630 : 0x111318), 0);
+            lv_obj_set_style_border_width(settings_rows_[i], selected ? 1 : 0, 0);
+            lv_obj_set_style_text_color(settings_row_labels_[i],
+                                        lv_color_hex(selected ? 0xFFFFFF : 0xCFD6E3), 0);
+            lv_obj_clear_flag(settings_rows_[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(settings_rows_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void GrokbotDisplay::OpenSettingsMenu() {
+    HideSettingsDock();
+    menu_idle_at_us_.store(NowUs() + 15000000LL, std::memory_order_relaxed);
+    menu_open_.store(true, std::memory_order_relaxed);
+    Application::GetInstance().Schedule([this]() {
+        DisplayLockGuard lock(this);
+        if (!lock || !settings_panel_)
+            return;
+        menu_selected_ = 0;
+        RebuildSettingsMenuLocked();
+        lv_obj_clear_flag(settings_panel_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(settings_panel_);
+    });
+}
+
+void GrokbotDisplay::CloseSettingsMenu() {
+    if (!menu_open_.exchange(false, std::memory_order_relaxed))
+        return;
+    Application::GetInstance().Schedule([this]() {
+        DisplayLockGuard lock(this);
+        if (lock && settings_panel_) {
+            lv_obj_add_flag(settings_panel_, LV_OBJ_FLAG_HIDDEN);
+        }
+    });
+}
+
+void GrokbotDisplay::ExecuteMenuItem(int index) {
+    MenuItem item;
+    {
+        DisplayLockGuard lock(this);
+        if (!lock || index < 0 || index >= static_cast<int>(menu_items_.size()))
+            return;
+        item = menu_items_[index];
+    }
+    switch (item.action) {
+        case MenuAction::kLang:
+            SetLanguage(!IsChinese());
+            menu_idle_at_us_.store(NowUs() + 15000000LL, std::memory_order_relaxed);
+            break;
+        case MenuAction::kBootOrient: {
+            {
+                Settings settings("display", true);
+                settings.SetBool("boot_orient", item.param != 0);
+            }
+            DisplayLockGuard lock(this);
+            if (lock)
+                RebuildSettingsMenuLocked();
+            menu_idle_at_us_.store(NowUs() + 15000000LL, std::memory_order_relaxed);
+            break;
+        }
+        case MenuAction::kWifiSelect:
+            CloseSettingsMenu();
+            if (select_ssid_cb_)
+                select_ssid_cb_(item.param);
+            break;
+        case MenuAction::kWifiConfig:
+            CloseSettingsMenu();
+            if (enter_wifi_config_cb_)
+                enter_wifi_config_cb_();
+            break;
+        case MenuAction::kClose:
+            CloseSettingsMenu();
+            break;
+    }
+}
+
+void GrokbotDisplay::SettingsNextItem() {
+    menu_idle_at_us_.store(NowUs() + 15000000LL, std::memory_order_relaxed);
+    Application::GetInstance().Schedule([this]() {
+        DisplayLockGuard lock(this);
+        if (!lock || menu_items_.empty())
+            return;
+        menu_selected_ = (menu_selected_ + 1) % static_cast<int>(menu_items_.size());
+        RebuildSettingsMenuLocked();
+    });
+}
+
+void GrokbotDisplay::SettingsSelectItem() {
+    menu_idle_at_us_.store(NowUs() + 15000000LL, std::memory_order_relaxed);
+    Application::GetInstance().Schedule([this]() { ExecuteMenuItem(menu_selected_); });
+}
+
+bool GrokbotDisplay::HandleTouch(bool down, int x, int y, int64_t now_ms) {
+    (void)now_ms;
+    if (down) {
+        if (!touch_tracking_) {
+            touch_tracking_ = true;
+            touch_consumed_ = false;
+            touch_start_x_ = x;
+            touch_start_y_ = y;
+        }
+        touch_last_x_ = x;
+        touch_last_y_ = y;
+        if (menu_open_.load(std::memory_order_relaxed)) {
+            menu_idle_at_us_.store(NowUs() + 15000000LL, std::memory_order_relaxed);
+            touch_consumed_ = true;
+            if (y - touch_start_y_ >= 45) {
+                CloseSettingsMenu();
+            }
+            return true;
+        }
+        if (dock_visible_.load(std::memory_order_relaxed)) {
+            dock_hide_at_us_.store(NowUs() + 5000000LL, std::memory_order_relaxed);
+            touch_consumed_ = true;
+            if (y - touch_start_y_ >= 35) {
+                HideSettingsDock();
+            }
+            return true;
+        }
+        if (!touch_consumed_ && touch_start_y_ >= height_ - 95 && touch_start_y_ - y >= 40) {
+            touch_consumed_ = true;
+            ShowSettingsDock();
+        }
+        return touch_consumed_;
+    }
+    if (!touch_tracking_)
+        return false;
+    touch_tracking_ = false;
+    const bool was_consumed = touch_consumed_;
+    touch_consumed_ = false;
+    if (menu_open_.load(std::memory_order_relaxed)) {
+        const int panel_left = (width_ - 256) / 2;
+        const int panel_top = (height_ - 256) / 2;
+        const int lx = touch_last_x_ - panel_left;
+        const int ly = touch_last_y_ - panel_top;
+        if (lx < 0 || lx > 256 || ly < 0 || ly > 256) {
+            CloseSettingsMenu();
+            return true;
+        }
+        const int row_y = ly - 40;
+        if (row_y >= 0) {
+            const int row = row_y / 36;
+            if (row >= 0 && row < kMaxMenuRows) {
+                Application::GetInstance().Schedule([this, row]() {
+                    menu_selected_ = row;
+                    ExecuteMenuItem(row);
+                });
+            }
+        }
+        return true;
+    }
+    if (dock_visible_.load(std::memory_order_relaxed)) {
+        const int btn_left = (width_ - 128) / 2;
+        const int btn_top = height_ - 64;
+        if (touch_last_x_ >= btn_left - 16 && touch_last_x_ <= btn_left + 144 &&
+            touch_last_y_ >= btn_top - 12 && touch_last_y_ <= btn_top + 52) {
+            OpenSettingsMenu();
+            return true;
+        }
+        return was_consumed;
+    }
+    return was_consumed;
+}
+
+const char* GrokbotDisplay::TranslateStatus(const char* status) const {
+    if (!status || !IsChinese())
+        return status;
+    if (strcmp(status, Lang::Strings::STANDBY) == 0)
+        return "待命中";
+    if (strcmp(status, Lang::Strings::LISTENING) == 0)
+        return "聆听中...";
+    if (strcmp(status, Lang::Strings::SPEAKING) == 0)
+        return "说话中";
+    if (strcmp(status, Lang::Strings::CONNECTING) == 0)
+        return "连接中...";
+    if (strcmp(status, Lang::Strings::INITIALIZING) == 0)
+        return "初始化中...";
+    if (strcmp(status, Lang::Strings::REGISTERING_NETWORK) == 0)
+        return "等待网络...";
+    if (strcmp(status, Lang::Strings::WIFI_CONFIG_MODE) == 0)
+        return "配网模式";
+    if (strcmp(status, Lang::Strings::SCANNING_WIFI) == 0)
+        return "扫描 Wi-Fi...";
+    if (strcmp(status, Lang::Strings::ACTIVATION) == 0)
+        return "设备激活";
+    if (strcmp(status, Lang::Strings::UPGRADING) == 0)
+        return "升级中...";
+    if (strcmp(status, Lang::Strings::LOADING_ASSETS) == 0)
+        return "加载资源...";
+    if (strcmp(status, Lang::Strings::CHECKING_NEW_VERSION) == 0)
+        return "检查更新...";
+    if (strcmp(status, Lang::Strings::ERROR) == 0)
+        return "错误";
+    return status;
+}
+
 void GrokbotDisplay::SetStatus(const char* status) {
     DisplayLockGuard lock(this);
     if (!lock)
         return;
+    last_raw_status_ = status ? status : "";
     show_expression_caption_ = status && (strcmp(status, Lang::Strings::STANDBY) == 0 ||
                                           strcmp(status, Lang::Strings::LISTENING) == 0 ||
                                           strcmp(status, Lang::Strings::SPEAKING) == 0);
@@ -564,7 +774,8 @@ void GrokbotDisplay::SetStatus(const char* status) {
         atlas_refresh_required_ = true;
     assets_update_in_progress_ = loading_assets;
     portEXIT_CRITICAL(&mailbox_mux_);
-    LvglDisplay::SetStatus(show_expression_caption_ ? expression_caption_ : status);
+    LvglDisplay::SetStatus(show_expression_caption_ ? expression_caption_
+                                                    : TranslateStatus(status));
 }
 
 void GrokbotDisplay::SetChatMessage(const char* role, const char* content) {
@@ -991,50 +1202,14 @@ bool GrokbotDisplay::RebuildCurrentFrame() {
     return PresentFrame();
 }
 
-void GrokbotDisplay::SetRotation(int degrees) {
-    rotation_.store(degrees * 10, std::memory_order_relaxed);
-}
-
-void GrokbotDisplay::MapTouch(int& x, int& y) {
-    if (!touch_down_.exchange(true)) {
-        // Wait for an in-flight rotation before taking the first point of the gesture.
-        DisplayLockGuard lock(this);
-    }
-    const int angle = displayed_rotation_.load();
-    lv_point_t point{x, y};
-    const lv_point_t center{width_ / 2, height_ / 2};
-    lv_point_transform(&point, -angle, 256, 256, &center, false);
-    x = point.x;
-    y = point.y;
-}
-
 void GrokbotDisplay::RefreshTaskEntry(void* arg) {
     auto* self = static_cast<GrokbotDisplay*>(arg);
-    bool logged_rotation = false;
     while (self->running_.load()) {
-        const bool frame_pending = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200)) != 0;
-        const int angle = self->rotation_.load(std::memory_order_relaxed);
-        const bool rotate = self->rotation_canvas_ && angle != self->displayed_rotation_.load() &&
-                            !self->touch_down_.load();
-        if (!frame_pending && !rotate)
-            continue;
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         {
             DisplayLockGuard lock(self);
-            if (lock && self->running_.load()) {
-                const bool apply_rotation = rotate && !self->touch_down_.load();
-                if (apply_rotation) {
-                    self->flush_rotation_ = angle;
-                    lv_obj_invalidate(lv_display_get_screen_active(self->display_));
-                }
+            if (lock && self->running_.load())
                 lv_refr_now(self->display_);
-                if (apply_rotation) {
-                    self->displayed_rotation_.store(angle);
-                    if (!logged_rotation) {
-                        ESP_LOGI(TAG, "Gravity rotation applied: %d degrees", angle / 10);
-                        logged_rotation = true;
-                    }
-                }
-            }
         }
         // Let status/chat callers acquire the shared display mutex between refreshes.
         vTaskDelay(1);
@@ -1079,6 +1254,18 @@ void GrokbotDisplay::AnimationTask() {
         }
 
         const int64_t now_ms = NowUs() / 1000;
+        const int64_t now_us = now_ms * 1000;
+        if (dock_visible_.load(std::memory_order_relaxed) &&
+            now_us >= dock_hide_at_us_.load(std::memory_order_relaxed)) {
+            HideSettingsDock();
+        }
+        if (menu_open_.load(std::memory_order_relaxed)) {
+            if (now_us >= menu_idle_at_us_.load(std::memory_order_relaxed)) {
+                CloseSettingsMenu();
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
         portENTER_CRITICAL(&mailbox_mux_);
         paused = assets_update_in_progress_;
         director_.SetNow(now_ms);
